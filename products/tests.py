@@ -174,7 +174,7 @@ class InventoryAPITests(TestCase):
             response.data["low_stock_products"][0]["product_id"],
             self.product.id,
         )
-    
+
     def test_inventory_summary_reports_stock_correctly(self):
         InventoryMovement.objects.create(
             product=self.product,
@@ -445,6 +445,7 @@ class ProductPermissionTests(APITestCase):
 
         self.assertEqual(response.status_code, 403)
 
+
     def test_staff_can_create_product(self):
         staff_user = User.objects.create_user(
             username="product_staff",
@@ -466,10 +467,14 @@ class ProductPermissionTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(
-            Product.objects.filter(name="Wireless Mouse").count(),
-            1,
+
+        product = Product.objects.get(name="Wireless Mouse")
+        self.assertEqual(product.stock_quantity, 0)
+
+        self.assertFalse(
+            InventoryMovement.objects.filter(product=product).exists()
         )
+
 
 
 
@@ -597,6 +602,34 @@ class ProductDetailTests(APITestCase):
 
         self.product.refresh_from_db()
         self.assertEqual(str(self.product.price), "28000.00")
+
+
+    def test_staff_cannot_change_stock_directly(self):
+        self.client.force_authenticate(user=self.staff_user)
+
+        original_stock = self.product.stock_quantity
+        original_movement_count = InventoryMovement.objects.filter(
+            product=self.product
+        ).count()
+
+        response = self.client.patch(
+            f"/api/products/{self.product.id}/",
+            {"stock_quantity": 999},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, original_stock)
+
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                product=self.product
+            ).count(),
+            original_movement_count,
+        )
+
 
     def test_missing_product_returns_404(self):
         self.client.force_authenticate(user=self.customer)
@@ -806,8 +839,6 @@ class InventoryJWTAuthorizationTests(APITestCase):
 
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock_quantity, 25)
-
-
 
 class CategoryAPITests(APITestCase):
     def setUp(self):
@@ -1198,7 +1229,7 @@ class PurchaseOrderAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 401)
 
-    
+
     def test_invalid_created_after_returns_400(self):
         response = self.client.get(
             self.purchase_orders_url,
@@ -1234,7 +1265,7 @@ class PurchaseOrderAPITests(APITestCase):
             response.data["results"][0]["id"],
             order_id,
         )
-    
+
     def test_non_numeric_supplier_filter_returns_400(self):
         response = self.client.get(
             self.purchase_orders_url,
@@ -1264,7 +1295,7 @@ class PurchaseOrderAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("date_range", response.data)
-    
+
     def test_staff_can_view_purchase_order_summary(self):
         self.create_purchase_order()
 

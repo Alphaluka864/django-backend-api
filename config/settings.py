@@ -30,7 +30,9 @@ if not SECRET_KEY:
         "Add it to your .env file."
     )
 
-DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() == "true"
+DEBUG = os.getenv("DJANGO_DEBUG", "False").strip().lower() in {
+    "true", "1", "yes", "on"
+}
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -214,3 +216,41 @@ STATIC_URL = "static/"
 # --------------------------------------------------
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
+# --------------------------------------------------
+# 14. Security hardening
+# --------------------------------------------------
+
+# HTTPS enforcement is enabled through environment variables in production.
+SECURE_SSL_REDIRECT = (
+    os.getenv("DJANGO_SECURE_SSL_REDIRECT", "False").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+SESSION_COOKIE_SECURE = (
+    os.getenv("DJANGO_SESSION_COOKIE_SECURE", "False").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+CSRF_COOKIE_SECURE = (
+    os.getenv("DJANGO_CSRF_COOKIE_SECURE", "False").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+SECURE_HSTS_SECONDS = int(
+    os.getenv("DJANGO_SECURE_HSTS_SECONDS", "0")
+)
+
+SECURE_HSTS_INCLUDE_SUBDOMAINS = (
+    os.getenv("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", "False")
+    .strip().lower() in {"true", "1", "yes", "on"}
+)
+
+SECURE_HSTS_PRELOAD = (
+    os.getenv("DJANGO_SECURE_HSTS_PRELOAD", "False").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"

@@ -126,29 +126,48 @@ class InventoryMovementListView(generics.ListAPIView):
 
 
 
+
 @api_view(["GET"])
 @permission_classes([IsAdminUser])
 def inventory_summary(request):
-    products = Product.objects.all().order_by("id")
+    products = list(
+        Product.objects.all().order_by("id")
+    )
+
+    movement_totals = (
+        InventoryMovement.objects
+        .values("product_id")
+        .annotate(
+            stock_in=Sum(
+                "quantity",
+                filter=Q(
+                    movement_type=InventoryMovement.MovementType.STOCK_IN
+                ),
+            ),
+            stock_out=Sum(
+                "quantity",
+                filter=Q(
+                    movement_type=InventoryMovement.MovementType.STOCK_OUT
+                ),
+            ),
+        )
+    )
+
+    totals_by_product = {
+        item["product_id"]: item
+        for item in movement_totals
+    }
 
     results = []
 
     for product in products:
-        movements = InventoryMovement.objects.filter(product=product)
-
-        stock_in = movements.filter(
-            movement_type=InventoryMovement.MovementType.STOCK_IN
-        ).aggregate(total=Sum("quantity"))["total"] or 0
-
-        stock_out = movements.filter(
-            movement_type=InventoryMovement.MovementType.STOCK_OUT
-        ).aggregate(total=Sum("quantity"))["total"] or 0
+        totals = totals_by_product.get(product.id, {})
 
         results.append({
             "product_id": product.id,
             "product_name": product.name,
-            "stock_in_total": stock_in,
-            "stock_out_total": stock_out,
+            "stock_in_total": totals.get("stock_in") or 0,
+            "stock_out_total": totals.get("stock_out") or 0,
             "current_stock": product.stock_quantity,
         })
 

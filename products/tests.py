@@ -257,6 +257,50 @@ class InventoryAPITests(TestCase):
         self.assertEqual(item["current_stock"], 20)
 
 
+    def test_inventory_summary_uses_constant_query_count(self):
+        Product.objects.create(
+            name="Pilau",
+            description="Rice dish",
+            price=Decimal("3000.00"),
+            stock_quantity=15,
+            category=self.category,
+        )
+
+        Product.objects.create(
+            name="Chapati",
+            description="Flatbread",
+            price=Decimal("1000.00"),
+            stock_quantity=8,
+            category=self.category,
+        )
+
+        with self.assertNumQueries(2):
+            response = self.client.get("/api/inventory/summary/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_products"], 3)
+        self.assertEqual(len(response.data["inventory"]), 3)
+
+        products_by_id = {
+            item["product_id"]: item
+            for item in response.data["inventory"]
+        }
+
+        self.assertEqual(
+            products_by_id[self.product.id]["stock_in_total"],
+            0,
+        )
+        self.assertEqual(
+            products_by_id[self.product.id]["stock_out_total"],
+            0,
+        )
+        self.assertEqual(
+            products_by_id[self.product.id]["current_stock"],
+            20,
+        )
+
+
+
     def test_inventory_summary_requires_staff_access(self):
         self.client.force_authenticate(user=self.customer)
 

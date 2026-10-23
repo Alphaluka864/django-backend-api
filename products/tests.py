@@ -12,6 +12,7 @@ from .models import (
     Supplier,
     PurchaseOrder,
 )
+from django.db import IntegrityError, transaction
 
 
 class InventoryAPITests(TestCase):
@@ -145,6 +146,59 @@ class InventoryAPITests(TestCase):
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock_quantity, 20)
 
+    def test_database_rejects_zero_quantity_movement(self):
+        movement_count = InventoryMovement.objects.count()
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                InventoryMovement.objects.create(
+                    product=self.product,
+                    movement_type="IN",
+                    quantity=0,
+                    note="Invalid zero quantity",
+                    created_by=self.staff_user,
+                )
+
+        self.assertEqual(
+            InventoryMovement.objects.count(),
+            movement_count,
+        )
+
+    def test_database_rejects_negative_quantity_movement(self):
+        movement_count = InventoryMovement.objects.count()
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                InventoryMovement.objects.create(
+                    product=self.product,
+                    movement_type="IN",
+                    quantity=-5,
+                    note="Invalid negative quantity",
+                    created_by=self.staff_user,
+                )
+
+        self.assertEqual(
+            InventoryMovement.objects.count(),
+            movement_count,
+        )
+
+    def test_database_rejects_invalid_movement_type(self):
+        movement_count = InventoryMovement.objects.count()
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                InventoryMovement.objects.create(
+                    product=self.product,
+                    movement_type="BAD",
+                    quantity=5,
+                    note="Invalid movement type",
+                    created_by=self.staff_user,
+                )
+
+        self.assertEqual(
+            InventoryMovement.objects.count(),
+            movement_count,
+        )
 
     def test_nonexistent_product_is_rejected(self):
         response = self.client.post(

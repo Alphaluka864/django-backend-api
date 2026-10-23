@@ -61,6 +61,18 @@ class InventoryMovement(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0),
+                name="inventory_movement_quantity_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    movement_type__in=["IN", "OUT"]
+                ),
+                name="inventory_movement_type_valid",
+            ),
+        ]
 
     def __str__(self):
         return (

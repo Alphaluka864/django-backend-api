@@ -1,0 +1,108 @@
+
+from django.urls import path
+
+from .views import (
+    health_check,
+    ProductListCreateView,
+    ProductDetailView,
+    UserRegistrationView,
+    InventoryMovementCreateView,
+    InventoryMovementListView,
+    inventory_summary,
+    low_stock_products,
+    CategoryListCreateView,
+    SupplierListCreateView,
+    SupplierDetailView,
+    PurchaseOrderListCreateView,
+    PurchaseOrderDetailView,
+    PurchaseOrderMarkOrderedView,
+    PurchaseOrderReceiveView,
+    PurchaseOrderCancelView,
+    PurchaseOrderSummaryView,
+    
+)
+
+urlpatterns = [
+    path("health/", health_check, name="health-check"),
+
+    path(
+        "products/",
+        ProductListCreateView.as_view(),
+        name="product-list-create",
+    ),
+    path(
+        "products/<int:pk>/",
+        ProductDetailView.as_view(),
+        name="product-detail",
+    ),
+    path(
+        "register/",
+        UserRegistrationView.as_view(),
+        name="user-register",
+    ),
+    path(
+        "inventory/movements/",
+        InventoryMovementCreateView.as_view(),
+        name="inventory-movement-create",
+    ),
+    path(
+        "inventory/movements/history/",
+        InventoryMovementListView.as_view(),
+        name="inventory-movement-history",
+    ),
+    path(
+        "inventory/summary/",
+        inventory_summary,
+        name="inventory-summary",
+    ),
+    path(
+        "inventory/low-stock/",
+        low_stock_products,
+        name="low-stock-products",
+    ),
+    path(
+    "categories/",
+    CategoryListCreateView.as_view(),
+    name="category-list-create",
+    ),
+    path(
+    "suppliers/",
+    SupplierListCreateView.as_view(),
+    name="supplier-list-create",
+    ),
+    path(
+        "suppliers/<int:pk>/",
+        SupplierDetailView.as_view(),
+        name="supplier-detail",
+    ),
+    path(
+    "purchase-orders/",
+    PurchaseOrderListCreateView.as_view(),
+    name="purchase-order-list-create",
+    ),
+        path(
+        "purchase-orders/summary/",
+        PurchaseOrderSummaryView.as_view(),
+        name="purchase-order-summary",
+    ),
+    path(
+        "purchase-orders/<int:pk>/",
+        PurchaseOrderDetailView.as_view(),
+        name="purchase-order-detail",
+    ),
+    path(
+    "purchase-orders/<int:pk>/order/",
+    PurchaseOrderMarkOrderedView.as_view(),
+    name="purchase-order-mark-ordered",
+    ),
+    path(
+        "purchase-orders/<int:pk>/receive/",
+        PurchaseOrderReceiveView.as_view(),
+        name="purchase-order-receive",
+    ),
+    path(
+    "purchase-orders/<int:pk>/cancel/",
+    PurchaseOrderCancelView.as_view(),
+    name="purchase-order-cancel",
+    ),
+]

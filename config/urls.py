@@ -20,10 +20,32 @@ from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
 )
+from rest_framework_simplejwt.views import TokenBlacklistView
+from products.throttles import (
+    LoginRateThrottle,
+    TokenRefreshRateThrottle,
+)
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include("products.urls")),
-    path("api/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
-    path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path(
+    "api/token/",
+    TokenObtainPairView.as_view(
+        throttle_classes=[LoginRateThrottle]
+    ),
+    name="token_obtain_pair",
+    ),
+    path(
+    "api/token/refresh/",
+    TokenRefreshView.as_view(
+        throttle_classes=[TokenRefreshRateThrottle]
+    ),
+    name="token_refresh",
+    ),
+    path(
+        "api/token/blacklist/",
+        TokenBlacklistView.as_view(),
+        name="token_blacklist",
+    ),
 ]

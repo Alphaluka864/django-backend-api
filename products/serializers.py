@@ -1,12 +1,22 @@
 
 from rest_framework import serializers
-from .models import Product, Category, InventoryMovement,Supplier
+from .models import (
+    Product,
+    Category,
+    InventoryMovement,
+    Supplier,
+    SellerProfile,
+    CustomerOrder,
+    CustomerOrderItem,
+)
 from django.contrib.auth.models import User
 
 from django.db import transaction
 from rest_framework import serializers
-from .models import PurchaseOrder, PurchaseOrderItem
-
+from .models import PurchaseOrder, PurchaseOrderItem,ProductAuditLog
+from django.contrib.auth.password_validation import validate_password
+import secrets
+from decimal import Decimal
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -16,6 +26,7 @@ class CategorySerializer(serializers.ModelSerializer):
         
         
         
+
 class ProductSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     category_id = serializers.PrimaryKeyRelatedField(
@@ -25,6 +36,12 @@ class ProductSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+    def validate_status(self, value):
+        if self.instance is not None:
+            raise serializers.ValidationError(
+                "Use the product workflow endpoints to change status."
+            )
+        return value
 
     class Meta:
         model = Product
@@ -36,12 +53,14 @@ class ProductSerializer(serializers.ModelSerializer):
             "stock_quantity",
             "category",
             "category_id",
+            "status",
             "created_at",
             "updated_at",
         ]
         read_only_fields = [
             "id",
             "stock_quantity",
+            "status",
             "created_at",
             "updated_at",
         ]
@@ -71,6 +90,11 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
                 "password2": "Passwords do not match."
             })
 
+        validate_password(
+            attrs["password"],
+            user=User(username=attrs.get("username", "")),
+        )
+
         return attrs
 
     def create(self, validated_data):
@@ -82,6 +106,56 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         )
 
         return user
+
+
+class SellerApplicationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SellerProfile
+        fields = [
+            "id",
+            "business_name",
+            "description",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_business_name(self, value):
+        value = value.strip()
+
+        if not value:
+            raise serializers.ValidationError(
+                "Business name cannot be empty."
+            )
+
+        if SellerProfile.objects.filter(
+            business_name__iexact=value
+        ).exists():
+            raise serializers.ValidationError(
+                "A seller profile with this business name already exists."
+            )
+
+        return value
+
+    def create(self, validated_data):
+        request = self.context["request"]
+
+        if SellerProfile.objects.filter(user=request.user).exists():
+            raise serializers.ValidationError(
+                "You already have a seller profile."
+            )
+
+        return SellerProfile.objects.create(
+            user=request.user,
+            **validated_data,
+        )
+
 
 
 
@@ -319,3 +393,297 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             )
 
         return purchase_order
+    
+
+class ProductAuditLogSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+
+    actor_username = serializers.CharField(
+        source="actor.username",
+        read_only=True,
+    )
+
+    class Meta:
+        model = ProductAuditLog
+        fields = [
+            "id",
+            "product",
+            "product_name",
+            "actor",
+            "actor_username",
+            "action",
+            "previous_status",
+            "new_status",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+
+class SellerProfileAdminSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(
+        source="user.username",
+        read_only=True,
+    )
+
+    class Meta:
+        model = SellerProfile
+        fields = [
+            "id",
+            "username",
+            "business_name",
+            "description",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "username",
+            "business_name",
+            "description",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_status(self, value):
+        allowed_statuses = [
+            SellerProfile.Status.APPROVED,
+            SellerProfile.Status.REJECTED,
+            SellerProfile.Status.SUSPENDED,
+        ]
+
+        if value not in allowed_statuses:
+            raise serializers.ValidationError(
+                "Invalid seller status."
+            )
+
+        return value
+
+
+
+
+
+
+class CustomerOrderItemInputSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class CustomerOrderItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CustomerOrderItem
+        fields = [
+            "id",
+            "product",
+            "product_name",
+            "seller",
+            "quantity",
+            "fulfillment_status",
+            "unit_price",
+            "line_total",
+        ]
+        read_only_fields = fields
+
+    def get_line_total(self, obj):
+        return obj.line_total
+
+class SellerOrderItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+    order_number = serializers.CharField(
+        source="order.order_number",
+        read_only=True,
+    )
+    customer_username = serializers.CharField(
+        source="order.customer.username",
+        read_only=True,
+    )
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CustomerOrderItem
+        fields = [
+            "id",
+            "order",
+            "order_number",
+            "customer_username",
+            "product",
+            "product_name",
+            "quantity",
+            "unit_price",
+            "line_total",
+            "fulfillment_status",
+        ]
+        read_only_fields = fields
+
+    def get_line_total(self, obj):
+        return obj.line_total
+
+
+class CustomerOrderSerializer(serializers.ModelSerializer):
+    items = CustomerOrderItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CustomerOrder
+        fields = [
+            "id",
+            "order_number",
+            "status",
+            "total_amount",
+            "items",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+
+class CustomerCheckoutSerializer(serializers.Serializer):
+    items = CustomerOrderItemInputSerializer(many=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError(
+                "An order must contain at least one item."
+            )
+
+        product_ids = [item["product_id"] for item in items]
+
+        if len(product_ids) != len(set(product_ids)):
+            raise serializers.ValidationError(
+                "Each product can appear only once in an order."
+            )
+
+        return items
+
+    @transaction.atomic
+    def create(self, validated_data):
+        request = self.context["request"]
+        requested_items = validated_data["items"]
+
+        product_ids = sorted(
+            item["product_id"] for item in requested_items
+        )
+        quantities = {
+            item["product_id"]: item["quantity"]
+            for item in requested_items
+        }
+
+        products = list(
+            Product.objects
+            .select_for_update(of=("self",))
+            .filter(id__in=product_ids)
+            .order_by("id")
+            .select_related("owner")
+        )
+
+        products_by_id = {product.id: product for product in products}
+
+        if len(products_by_id) != len(product_ids):
+            raise serializers.ValidationError({
+                "items": "One or more products do not exist."
+            })
+
+        for product_id in product_ids:
+            product = products_by_id[product_id]
+            quantity = quantities[product_id]
+
+            if product.status != Product.Status.PUBLISHED:
+                raise serializers.ValidationError({
+                    "items": (
+                        f"Product {product_id} is not available for sale."
+                    )
+                })
+
+            if product.owner_id is None:
+                raise serializers.ValidationError({
+                    "items": (
+                        f"Product {product_id} has no assigned seller."
+                    )
+                })
+
+            seller_profile = SellerProfile.objects.filter(
+                user_id=product.owner_id,
+                status=SellerProfile.Status.APPROVED,
+            ).exists()
+
+            if not seller_profile:
+                raise serializers.ValidationError({
+                    "items": (
+                        f"Product {product_id} does not have an "
+                        "approved seller."
+                    )
+                })
+
+            if product.price <= Decimal("0"):
+                raise serializers.ValidationError({
+                    "items": (
+                        f"Product {product_id} has an invalid price."
+                    )
+                })
+
+            if quantity > product.stock_quantity:
+                raise serializers.ValidationError({
+                    "items": (
+                        f"Insufficient stock for {product.name}. "
+                        f"Available: {product.stock_quantity}."
+                    )
+                })
+
+        order = CustomerOrder.objects.create(
+            order_number=f"CO-{secrets.token_hex(12).upper()}",
+            customer=request.user,
+            total_amount=Decimal("0.00"),
+        )
+
+        total = Decimal("0.00")
+
+        for product_id in product_ids:
+            product = products_by_id[product_id]
+            quantity = quantities[product_id]
+            unit_price = product.price
+
+            CustomerOrderItem.objects.create(
+                order=order,
+                product=product,
+                seller_id=product.owner_id,
+                quantity=quantity,
+                unit_price=unit_price,
+            )
+
+            product.stock_quantity -= quantity
+            product.save(
+                update_fields=["stock_quantity", "updated_at"]
+            )
+
+            InventoryMovement.objects.create(
+                product=product,
+                movement_type=InventoryMovement.MovementType.STOCK_OUT,
+                quantity=quantity,
+                note=f"Customer order {order.order_number}",
+                created_by=request.user,
+            )
+
+            total += unit_price * quantity
+
+        order.total_amount = total
+        order.save(update_fields=["total_amount", "updated_at"])
+
+        return order
+
+
+class SellerOrderStatusUpdateSerializer(serializers.Serializer):
+    fulfillment_status = serializers.ChoiceField(
+        choices=CustomerOrderItem.FulfillmentStatus.choices,
+    )

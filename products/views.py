@@ -7,9 +7,17 @@ from rest_framework.decorators import (
 )
 from rest_framework.response import Response
 
-from .models import Product
-from .serializers import ProductSerializer ,UserRegistrationSerializer
-from .permissions import IsAdminOrReadOnly
+from .models import Product, ProductAuditLog, SellerProfile
+from .serializers import ProductAuditLogSerializer
+from .serializers import (
+    ProductSerializer,
+    UserRegistrationSerializer,
+    SellerApplicationSerializer,
+)
+from .permissions import (
+    IsAdminOrReadOnly,
+    IsApprovedSellerOrAdmin,
+)
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from .models import InventoryMovement
@@ -30,7 +38,22 @@ from django.db import transaction
 from django.utils.dateparse import parse_date
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from decimal import Decimal
-
+from .throttles import RegistrationRateThrottle
+from rest_framework.generics import ListAPIView
+from .serializers import ProductAuditLogSerializer
+from .serializers import SellerProfileAdminSerializer
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .serializers import (
+    CustomerCheckoutSerializer,
+    CustomerOrderSerializer,
+    SellerOrderItemSerializer,
+    SellerOrderStatusUpdateSerializer,
+)
+from .models import CustomerOrder, CustomerOrderItem
+from django.db import transaction
 
 
 
@@ -43,31 +66,317 @@ def health_check(request):
     })
 
 
+
+
 class ProductListCreateView(generics.ListCreateAPIView):
-    queryset = Product.objects.all().order_by("id")
     serializer_class = ProductSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [IsApprovedSellerOrAdmin]
+
     filter_backends = [
         DjangoFilterBackend,
         SearchFilter,
         OrderingFilter,
     ]
-    filterset_fields = ["category", "price"]
+
+    filterset_fields = ["category", "price", "status"]
     search_fields = ["name", "description", "category__name"]
-    ordering_fields = ["name", "price", "created_at", "stock_quantity"]
+    ordering_fields = [
+        "name",
+        "price",
+        "created_at",
+        "stock_quantity",
+    ]
     ordering = ["id"]
-    
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Product.objects.select_related(
+            "category",
+            "owner",
+        )
+
+        if user.is_authenticated and user.is_staff:
+            return queryset.order_by("id")
+
+        if (
+            user.is_authenticated
+            and hasattr(user, "seller_profile")
+            and user.seller_profile.status == SellerProfile.Status.APPROVED
+        ):
+            if self.request.query_params.get("manage") == "true":
+                queryset = queryset.filter(owner=user)
+            else:
+                queryset = queryset.filter(
+                    status=Product.Status.PUBLISHED
+                )
+
+        else:
+            queryset = queryset.filter(
+                status=Product.Status.PUBLISHED
+            )
+
+        return queryset.order_by("id")
+
+    def perform_create(self, serializer):
+        user = self.request.user
+
+        if user.is_staff:
+            serializer.save()
+            return
+
+        serializer.save(
+            owner=user,
+            status=Product.Status.DRAFT,
+        )
+
+
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [IsApprovedSellerOrAdmin]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Product.objects.select_related(
+            "category",
+            "owner",
+        )
+
+        if user.is_authenticated and user.is_staff:
+            return queryset
+
+        if (
+            user.is_authenticated
+            and hasattr(user, "seller_profile")
+            and user.seller_profile.status == SellerProfile.Status.APPROVED
+        ):
+            if self.request.method not in permissions.SAFE_METHODS:
+                return queryset.filter(owner=user)
+
+            if self.request.query_params.get("manage") == "true":
+                return queryset.filter(owner=user)
+
+            return queryset.filter(
+                status=Product.Status.PUBLISHED
+            )
+
+        return queryset.filter(
+            status=Product.Status.PUBLISHED
+        )
+
+
+
+
+class ProductWorkflowActionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    transitions = {
+        "submit-review": (
+            Product.Status.DRAFT,
+            Product.Status.UNDER_REVIEW,
+            ProductAuditLog.Action.SUBMITTED,
+        ),
+        "approve": (
+            Product.Status.UNDER_REVIEW,
+            Product.Status.PUBLISHED,
+            ProductAuditLog.Action.APPROVED,
+        ),
+        "return-to-draft": (
+            Product.Status.UNDER_REVIEW,
+            Product.Status.DRAFT,
+            ProductAuditLog.Action.RETURNED,
+        ),
+    }
+
+    def post(self, request, pk, action):
+        if action not in self.transitions:
+            return Response(
+                {"detail": "Unknown workflow action."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+
+        # Only administrators can approve or return products.
+        if action in {"approve", "return-to-draft"}:
+            if not user.is_staff:
+                return Response(
+                    {"detail": "Administrator access required."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # Submission is available to administrators and approved
+        # sellers, but sellers can submit only their own products.
+        elif action == "submit-review":
+            if not user.is_staff:
+                try:
+                    approved_seller = (
+                        user.seller_profile.status
+                        == SellerProfile.Status.APPROVED
+                    )
+                except SellerProfile.DoesNotExist:
+                    approved_seller = False
+
+                if not approved_seller:
+                    return Response(
+                        {
+                            "detail": (
+                                "Only approved sellers can submit "
+                                "products for review."
+                            )
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
+        expected_status, new_status, audit_action = (
+            self.transitions[action]
+        )
+
+        with transaction.atomic():
+            try:
+                product = (
+                    Product.objects
+                    .select_for_update()
+                    .get(pk=pk)
+                )
+            except Product.DoesNotExist:
+                return Response(
+                    {"detail": "Product not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # Sellers must own the product they submit.
+            if (
+                action == "submit-review"
+                and not user.is_staff
+                and product.owner_id != user.id
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "You can submit only your own products."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            if product.status != expected_status:
+                return Response(
+                    {
+                        "detail": (
+                            f"Cannot perform '{action}' when product "
+                            f"status is '{product.status}'."
+                        ),
+                        "current_status": product.status,
+                        "required_status": expected_status,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            previous_status = product.status
+            product.status = new_status
+            product.save(update_fields=["status", "updated_at"])
+
+            ProductAuditLog.objects.create(
+                product=product,
+                actor=user,
+                action=audit_action,
+                previous_status=previous_status,
+                new_status=new_status,
+            )
+
+        return Response(
+            {
+                "id": product.id,
+                "name": product.name,
+                "status": product.status,
+                "message": (
+                    f"Product workflow action '{action}' completed."
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ProductReviewQueueView(ListAPIView):
+    serializer_class = ProductSerializer
+    permission_classes = [IsAdminUser]
+
+    def get_queryset(self):
+        return (
+            Product.objects
+            .filter(status=Product.Status.UNDER_REVIEW)
+            .select_related("category")
+            .order_by("created_at", "id")
+        )
+
+
+class ProductAuditLogListView(ListAPIView):
+    serializer_class = ProductAuditLogSerializer
+    permission_classes = [IsAdminUser]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+
+    filterset_fields = ["product", "action"]
+    ordering_fields = ["created_at", "id"]
+    ordering = ["-created_at", "-id"]
+
+    def get_queryset(self):
+        return (
+            ProductAuditLog.objects
+            .select_related("product", "actor")
+            .all()
+        )
+
+class ProductAuditHistoryView(ListAPIView):
+    serializer_class = ProductAuditLogSerializer
+    permission_classes = [IsAdminUser]
+
+    def get_queryset(self):
+        return (
+            ProductAuditLog.objects
+            .filter(product_id=self.kwargs["pk"])
+            .select_related("product", "actor")
+            .order_by("-created_at", "-id")
+        )
 
 
 class UserRegistrationView(generics.CreateAPIView):
     serializer_class = UserRegistrationSerializer
     permission_classes = [permissions.AllowAny]
-    
-    
+    throttle_classes = [RegistrationRateThrottle]
+
+
+class SellerApplicationView(generics.CreateAPIView):
+    serializer_class = SellerApplicationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return SellerProfile.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+ 
+class AdminSellerApplicationListView(generics.ListAPIView):
+    serializer_class = SellerProfileAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+
+    def get_queryset(self):
+        queryset = SellerProfile.objects.select_related("user")
+
+        application_status = self.request.query_params.get("status")
+
+        if application_status:
+            queryset = queryset.filter(status=application_status.upper())
+
+        return queryset
+
+
+class AdminSellerApplicationReviewView(generics.UpdateAPIView):
+    serializer_class = SellerProfileAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+    queryset = SellerProfile.objects.select_related("user")
+    http_method_names = ["patch", "head", "options"]
+  
 
 class InventoryMovementCreateView(generics.CreateAPIView):
     queryset = InventoryMovement.objects.all()
@@ -573,5 +882,479 @@ class PurchaseOrderCancelView(APIView):
                 "status": purchase_order.status,
                 "message": "Purchase order cancelled successfully.",
             },
+            status=status.HTTP_200_OK,
+        )
+
+class SellerDashboardView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # Administrators use the global dashboard.
+        if user.is_staff:
+            return Response(
+                {
+                    "detail": (
+                        "Administrators should use "
+                        "/api/dashboard/summary/."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            seller_profile = user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response(
+                {"detail": "You do not have a seller profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if seller_profile.status != SellerProfile.Status.APPROVED:
+            return Response(
+                {
+                    "detail": (
+                        "An approved seller profile is required "
+                        "to access this dashboard."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        products = Product.objects.filter(owner=user)
+
+        summary = products.aggregate(
+            total=Count("id"),
+            published=Count(
+                "id",
+                filter=Q(status=Product.Status.PUBLISHED),
+            ),
+            drafts=Count(
+                "id",
+                filter=Q(status=Product.Status.DRAFT),
+            ),
+            under_review=Count(
+                "id",
+                filter=Q(status=Product.Status.UNDER_REVIEW),
+            ),
+            total_units_in_stock=Sum("stock_quantity"),
+        )
+
+        low_stock_count = products.filter(
+            stock_quantity__lt=5
+        ).count()
+
+        return Response(
+            {
+                "business_name": seller_profile.business_name,
+                "products": {
+                    "total": summary["total"],
+                    "published": summary["published"],
+                    "drafts": summary["drafts"],
+                    "under_review": summary["under_review"],
+                },
+                "inventory": {
+                    "total_units_in_stock": (
+                        summary["total_units_in_stock"] or 0
+                    ),
+                    "low_stock_products": low_stock_count,
+                    "low_stock_threshold": 5,
+                },
+            }
+        )
+
+
+
+class SellerDashboardSummaryView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        product_summary = Product.objects.aggregate(
+            total=Count("id"),
+            published=Count(
+                "id",
+                filter=Q(status=Product.Status.PUBLISHED),
+            ),
+            drafts=Count(
+                "id",
+                filter=Q(status=Product.Status.DRAFT),
+            ),
+            under_review=Count(
+                "id",
+                filter=Q(status=Product.Status.UNDER_REVIEW),
+            ),
+            total_units_in_stock=Sum("stock_quantity"),
+        )
+
+        low_stock_count = Product.objects.filter(
+            stock_quantity__lt=5
+        ).count()
+
+        purchase_order_summary = PurchaseOrder.objects.aggregate(
+            total=Count("id"),
+            draft=Count(
+                "id",
+                filter=Q(status=PurchaseOrder.Status.DRAFT),
+            ),
+            ordered=Count(
+                "id",
+                filter=Q(status=PurchaseOrder.Status.ORDERED),
+            ),
+            received=Count(
+                "id",
+                filter=Q(status=PurchaseOrder.Status.RECEIVED),
+            ),
+            cancelled=Count(
+                "id",
+                filter=Q(status=PurchaseOrder.Status.CANCELLED),
+            ),
+        )
+
+        recent_activity = (
+            ProductAuditLog.objects
+            .select_related("product", "actor")
+            .order_by("-created_at", "-id")[:5]
+        )
+
+        recent_activity_data = ProductAuditLogSerializer(
+            recent_activity,
+            many=True,
+        ).data
+
+        return Response({
+            "products": {
+                "total": product_summary["total"],
+                "published": product_summary["published"],
+                "drafts": product_summary["drafts"],
+                "under_review": product_summary["under_review"],
+            },
+            "inventory": {
+                "total_units_in_stock": (
+                    product_summary["total_units_in_stock"] or 0
+                ),
+                "low_stock_products": low_stock_count,
+                "low_stock_threshold": 5,
+            },
+            "purchase_orders": purchase_order_summary,
+            "recent_activity": recent_activity_data,
+        })
+
+
+class CustomerCheckoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = CustomerCheckoutSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        order = serializer.save()
+
+        return Response(
+            CustomerOrderSerializer(order).data,
+            status=201,
+        )
+
+
+class CustomerOrderListView(ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerOrderSerializer
+
+    def get_queryset(self):
+        return (
+            CustomerOrder.objects
+            .filter(customer=self.request.user)
+            .prefetch_related("items__product")
+            .order_by("-created_at", "-id")
+        )
+
+
+class CustomerOrderDetailView(RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerOrderSerializer
+
+    def get_queryset(self):
+        return (
+            CustomerOrder.objects
+            .filter(customer=self.request.user)
+            .prefetch_related("items__product")
+        )
+
+
+class CustomerOrderCancelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            try:
+                order = (
+                    CustomerOrder.objects
+                    .select_for_update()
+                    .get(pk=pk, customer=request.user)
+                )
+            except CustomerOrder.DoesNotExist:
+                from rest_framework.exceptions import NotFound
+                raise NotFound("Order not found.")
+
+            items = list(
+                CustomerOrderItem.objects
+                .select_for_update()
+                .filter(order=order)
+                .order_by("id")
+            )
+
+            cancellable_statuses = {
+                CustomerOrderItem.FulfillmentStatus.PENDING,
+                CustomerOrderItem.FulfillmentStatus.CONFIRMED,
+            }
+
+            if not items:
+                raise ValidationError(
+                    "This order has no items to cancel."
+                )
+
+            if any(
+                item.fulfillment_status not in cancellable_statuses
+                for item in items
+            ):
+                raise ValidationError(
+                    "This order cannot be cancelled because "
+                    "one or more items have progressed beyond "
+                    "the cancellable stage."
+                )
+
+            for item in items:
+                product = (
+                    Product.objects
+                    .select_for_update()
+                    .get(pk=item.product_id)
+                )
+
+                product.stock_quantity += item.quantity
+                product.save(update_fields=["stock_quantity"])
+
+                InventoryMovement.objects.create(
+                    product=product,
+                    movement_type=(
+                        InventoryMovement.MovementType.STOCK_IN
+                    ),
+                    quantity=item.quantity,
+                    created_by=request.user,
+                    note=(
+                        f"Customer cancelled order "
+                        f"{order.order_number}, item {item.pk}"
+                    )[:255],
+                )
+
+                item.fulfillment_status = (
+                    CustomerOrderItem.FulfillmentStatus.CANCELLED
+                )
+                item.save(update_fields=["fulfillment_status"])
+
+            order.status = CustomerOrder.Status.CANCELLED
+            order.save(update_fields=["status", "updated_at"])
+
+        order.refresh_from_db()
+
+        return Response(
+            CustomerOrderSerializer(order).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class SellerOrderListView(ListAPIView):
+    permission_classes = [IsApprovedSellerOrAdmin]
+    serializer_class = SellerOrderItemSerializer
+
+    def get_queryset(self):
+        return (
+            CustomerOrderItem.objects
+            .filter(seller=self.request.user)
+            .select_related(
+                "order",
+                "order__customer",
+                "product",
+            )
+            .order_by("-order__created_at", "-id")
+        )
+        
+class SellerOrderDetailView(RetrieveAPIView):
+    permission_classes = [IsApprovedSellerOrAdmin]
+    serializer_class = SellerOrderItemSerializer
+
+    def get_queryset(self):
+        return (
+            CustomerOrderItem.objects
+            .filter(seller=self.request.user)
+            .select_related(
+                "order",
+                "order__customer",
+                "product",
+            )
+        )
+
+class SellerOrderStatusUpdateView(APIView):
+    permission_classes = [IsApprovedSellerOrAdmin]
+
+    ALLOWED_TRANSITIONS = {
+        CustomerOrderItem.FulfillmentStatus.PENDING: {
+            CustomerOrderItem.FulfillmentStatus.CONFIRMED,
+            CustomerOrderItem.FulfillmentStatus.CANCELLED,
+        },
+        CustomerOrderItem.FulfillmentStatus.CONFIRMED: {
+            CustomerOrderItem.FulfillmentStatus.PROCESSING,
+            CustomerOrderItem.FulfillmentStatus.CANCELLED,
+        },
+        CustomerOrderItem.FulfillmentStatus.PROCESSING: {
+            CustomerOrderItem.FulfillmentStatus.SHIPPED,
+            CustomerOrderItem.FulfillmentStatus.CANCELLED,
+        },
+        CustomerOrderItem.FulfillmentStatus.SHIPPED: {
+            CustomerOrderItem.FulfillmentStatus.DELIVERED,
+        },
+        CustomerOrderItem.FulfillmentStatus.DELIVERED: set(),
+        CustomerOrderItem.FulfillmentStatus.CANCELLED: set(),
+    }
+
+    def patch(self, request, pk):
+        serializer = SellerOrderStatusUpdateSerializer(
+            data=request.data
+        )
+        serializer.is_valid(raise_exception=True)
+        new_status = serializer.validated_data["fulfillment_status"]
+
+        with transaction.atomic():
+            # Find the parent order ID without acquiring an item lock.
+            # The parent order is always locked before its items.
+            try:
+                order_id = (
+                    CustomerOrderItem.objects
+                    .values_list("order_id", flat=True)
+                    .get(pk=pk, seller=request.user)
+                )
+            except CustomerOrderItem.DoesNotExist:
+                from rest_framework.exceptions import NotFound
+                raise NotFound("Order item not found.")
+
+            try:
+                order = (
+                    CustomerOrder.objects
+                    .select_for_update()
+                    .get(pk=order_id)
+                )
+            except CustomerOrder.DoesNotExist:
+                from rest_framework.exceptions import NotFound
+                raise NotFound("Order not found.")
+
+            # Lock the order's items in a consistent order.
+            locked_items = list(
+                CustomerOrderItem.objects
+                .select_for_update()
+                .filter(order=order)
+                .order_by("id")
+            )
+
+            item = next(
+                (
+                    order_item
+                    for order_item in locked_items
+                    if order_item.pk == pk
+                    and order_item.seller_id == request.user.pk
+                ),
+                None,
+            )
+
+            if item is None:
+                from rest_framework.exceptions import NotFound
+                raise NotFound("Order item not found.")
+
+            current_status = item.fulfillment_status
+
+            if new_status not in self.ALLOWED_TRANSITIONS[current_status]:
+                raise serializers.ValidationError({
+                    "fulfillment_status": (
+                        f"Cannot change status from {current_status} "
+                        f"to {new_status}."
+                    )
+                })
+
+            if new_status == CustomerOrderItem.FulfillmentStatus.CANCELLED:
+                product = (
+                    Product.objects
+                    .select_for_update()
+                    .get(pk=item.product_id)
+                )
+
+                product.stock_quantity += item.quantity
+                product.save(update_fields=["stock_quantity"])
+
+                InventoryMovement.objects.create(
+                    product=product,
+                    movement_type=(
+                        InventoryMovement.MovementType.STOCK_IN
+                    ),
+                    quantity=item.quantity,
+                    created_by=request.user,
+                    note=(
+                        f"Cancelled customer order "
+                        f"{order.order_number}, item {item.pk}"
+                    )[:255],
+                )
+
+            item.fulfillment_status = new_status
+            item.save(update_fields=["fulfillment_status"])
+
+            item_statuses = [
+                order_item.fulfillment_status
+                for order_item in locked_items
+            ]
+
+            active_statuses = [
+                item_status
+                for item_status in item_statuses
+                if item_status
+                != CustomerOrderItem.FulfillmentStatus.CANCELLED
+            ]
+
+            if not active_statuses:
+                order.status = CustomerOrder.Status.CANCELLED
+            elif all(
+                item_status
+                in {
+                    CustomerOrderItem.FulfillmentStatus.DELIVERED,
+                    CustomerOrderItem.FulfillmentStatus.CANCELLED,
+                }
+                for item_status in item_statuses
+            ):
+                order.status = CustomerOrder.Status.DELIVERED
+            elif (
+                CustomerOrderItem.FulfillmentStatus.PENDING
+                in active_statuses
+            ):
+                order.status = CustomerOrder.Status.PENDING
+            elif (
+                CustomerOrderItem.FulfillmentStatus.CONFIRMED
+                in active_statuses
+            ):
+                order.status = CustomerOrder.Status.CONFIRMED
+            elif (
+                CustomerOrderItem.FulfillmentStatus.PROCESSING
+                in active_statuses
+            ):
+                order.status = CustomerOrder.Status.PROCESSING
+            elif (
+                CustomerOrderItem.FulfillmentStatus.SHIPPED
+                in active_statuses
+            ):
+                order.status = CustomerOrder.Status.SHIPPED
+
+            order.save(update_fields=["status", "updated_at"])
+
+        item.refresh_from_db()
+
+        return Response(
+            SellerOrderItemSerializer(item).data,
             status=status.HTTP_200_OK,
         )

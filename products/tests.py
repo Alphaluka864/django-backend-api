@@ -11,9 +11,11 @@ from .models import (
     InventoryMovement,
     Supplier,
     PurchaseOrder,
+    ProductAuditLog,
 )
 from django.db import IntegrityError, transaction
-
+from django.core.cache import cache
+from .models import SellerProfile,CustomerOrder, CustomerOrderItem
 
 class InventoryAPITests(TestCase):
     def setUp(self):
@@ -739,6 +741,9 @@ class ProductDetailTests(APITestCase):
 
 
 class UserRegistrationTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        
     def test_user_can_register(self):
         response = self.client.post(
             "/api/register/",
@@ -792,11 +797,64 @@ class UserRegistrationTests(APITestCase):
         self.assertFalse(
             User.objects.filter(username="mismatch_customer").exists()
         )
+    def test_registration_rejects_common_password(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "username": "weak_password_user",
+                "password": "password",
+                "password2": "password",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(
+            User.objects.filter(
+                username="weak_password_user"
+            ).exists()
+        )
+
+    def test_registration_rejects_numeric_only_password(self):
+        response = self.client.post(
+            "/api/register/",
+            {
+                "username": "numeric_password_user",
+                "password": "1234567890",
+                "password2": "1234567890",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(
+            User.objects.filter(
+                username="numeric_password_user"
+            ).exists()
+        )
+    def test_registration_rate_limit(self):
+        for i in range(4):
+            response = self.client.post(
+                "/api/register/",
+                {
+                    "username": f"throttle_customer_{i}",
+                    "password": "SecureTestPass123!",
+                    "password2": "SecureTestPass123!",
+                },
+                format="json",
+            )
+
+            if i < 3:
+                self.assertEqual(response.status_code, 201)
+            else:
+                self.assertEqual(response.status_code, 429)
 
 
 
 class JWTAuthenticationTests(APITestCase):
     def setUp(self):
+        cache.clear()
+
         self.user = User.objects.create_user(
             username="jwt_customer",
             password="SecureTestPass123!",
@@ -848,6 +906,34 @@ class JWTAuthenticationTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("access", response.data)
+    def test_blacklisted_refresh_token_cannot_be_reused(self):
+        login_response = self.client.post(
+            "/api/token/",
+            {
+                "username": "jwt_customer",
+                "password": "SecureTestPass123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(login_response.status_code, 200)
+        refresh_token = login_response.data["refresh"]
+
+        logout_response = self.client.post(
+            "/api/token/blacklist/",
+            {"refresh": refresh_token},
+            format="json",
+        )
+
+        self.assertEqual(logout_response.status_code, 200)
+
+        refresh_response = self.client.post(
+            "/api/token/refresh/",
+            {"refresh": refresh_token},
+            format="json",
+        )
+
+        self.assertEqual(refresh_response.status_code, 401)
 
     def test_protected_inventory_endpoint_requires_authentication(self):
         response = self.client.get(
@@ -855,6 +941,21 @@ class JWTAuthenticationTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 401)
+    def test_login_rate_limit(self):
+        for i in range(6):
+            response = self.client.post(
+                "/api/token/",
+                {
+                    "username": f"unknown_user_{i}",
+                    "password": "WrongPassword123!",
+                },
+                format="json",
+            )
+
+            if i < 5:
+                self.assertEqual(response.status_code, 401)
+            else:
+                self.assertEqual(response.status_code, 429)
 
 
 class InventoryJWTAuthorizationTests(APITestCase):
@@ -1423,3 +1524,1741 @@ class PurchaseOrderAPITests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+    def test_customer_cannot_list_purchase_orders(self):
+        customer = User.objects.create_user(
+            username="po_security_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.get(self.purchase_orders_url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_create_purchase_orders(self):
+        customer = User.objects.create_user(
+            username="po_create_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.post(
+            self.purchase_orders_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_access_purchase_order_detail(self):
+        order_id = self.create_purchase_order()
+
+        customer = User.objects.create_user(
+            username="po_detail_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.get(
+            f"{self.purchase_orders_url}{order_id}/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_mark_purchase_order_as_ordered(self):
+        order_id = self.create_purchase_order()
+
+        customer = User.objects.create_user(
+            username="po_order_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.post(
+            f"{self.purchase_orders_url}{order_id}/order/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_receive_purchase_order(self):
+        order_id = self.create_purchase_order()
+
+        customer = User.objects.create_user(
+            username="po_receive_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.post(
+            f"{self.purchase_orders_url}{order_id}/receive/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_cancel_purchase_order(self):
+        order_id = self.create_purchase_order()
+
+        customer = User.objects.create_user(
+            username="po_cancel_customer",
+            password="SecureTestPass123!",
+        )
+        self.client.force_authenticate(user=customer)
+
+        response = self.client.post(
+            f"{self.purchase_orders_url}{order_id}/cancel/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+
+class ProductWorkflowAuditTests(APITestCase):
+    def setUp(self):
+        self.staff_user = User.objects.create_user(
+            username="workflow_staff",
+            password="TestPassword123!",
+            is_staff=True,
+        )
+
+        self.customer = User.objects.create_user(
+            username="workflow_customer",
+            password="TestPassword123!",
+            is_staff=False,
+        )
+
+        self.category = Category.objects.create(name="Workflow Food")
+
+        self.product = Product.objects.create(
+            name="Workflow Sambusa",
+            category=self.category,
+            price=Decimal("1500.00"),
+            stock_quantity=10,
+            status=Product.Status.DRAFT,
+        )
+
+        self.client.force_authenticate(user=self.staff_user)
+
+    def test_submit_review_creates_audit_record(self):
+        response = self.client.post(
+            f"/api/products/{self.product.id}/submit-review/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.product.refresh_from_db()
+
+        self.assertEqual(
+            self.product.status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+        audit = ProductAuditLog.objects.get(product=self.product)
+
+        self.assertEqual(audit.actor, self.staff_user)
+        self.assertEqual(audit.action, ProductAuditLog.Action.SUBMITTED)
+        self.assertEqual(audit.previous_status, Product.Status.DRAFT)
+        self.assertEqual(
+            audit.new_status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+    def test_invalid_transition_does_not_create_audit_record(self):
+        response = self.client.post(
+            f"/api/products/{self.product.id}/approve/"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            ProductAuditLog.objects.filter(product=self.product).count(),
+            0,
+        )
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.status, Product.Status.DRAFT)
+
+    def test_customer_cannot_access_audit_logs(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get("/api/product-audit-logs/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_anonymous_user_cannot_access_audit_logs(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get("/api/product-audit-logs/")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_audit_log_endpoint_filters_by_action(self):
+        ProductAuditLog.objects.create(
+            product=self.product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.SUBMITTED,
+            previous_status=Product.Status.DRAFT,
+            new_status=Product.Status.UNDER_REVIEW,
+        )
+
+        response = self.client.get(
+            "/api/product-audit-logs/?action=SUBMITTED"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(
+            response.data["results"][0]["action"],
+            "SUBMITTED",
+        )
+
+    def test_audit_log_endpoint_filters_by_product(self):
+        ProductAuditLog.objects.create(
+            product=self.product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.SUBMITTED,
+            previous_status=Product.Status.DRAFT,
+            new_status=Product.Status.UNDER_REVIEW,
+        )
+
+        response = self.client.get(
+            f"/api/product-audit-logs/?product={self.product.id}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+    def test_approval_creates_correct_audit_record(self):
+        self.product.status = Product.Status.UNDER_REVIEW
+        self.product.save(update_fields=["status", "updated_at"])
+
+        response = self.client.post(
+            f"/api/products/{self.product.id}/approve/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        audit = ProductAuditLog.objects.get(product=self.product)
+
+        self.assertEqual(audit.action, ProductAuditLog.Action.APPROVED)
+        self.assertEqual(
+            audit.previous_status,
+            Product.Status.UNDER_REVIEW,
+        )
+        self.assertEqual(audit.new_status, Product.Status.PUBLISHED)
+        self.assertEqual(audit.actor, self.staff_user)
+
+    def test_return_to_draft_creates_correct_audit_record(self):
+        self.product.status = Product.Status.UNDER_REVIEW
+        self.product.save(update_fields=["status", "updated_at"])
+
+        response = self.client.post(
+            f"/api/products/{self.product.id}/return-to-draft/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        audit = ProductAuditLog.objects.get(product=self.product)
+
+        self.assertEqual(audit.action, ProductAuditLog.Action.RETURNED)
+        self.assertEqual(
+            audit.previous_status,
+            Product.Status.UNDER_REVIEW,
+        )
+        self.assertEqual(audit.new_status, Product.Status.DRAFT)
+
+    def test_product_audit_history_returns_only_requested_product(self):
+        other_product = Product.objects.create(
+            name="Other Workflow Product",
+            category=self.category,
+            price=Decimal("2000.00"),
+            status=Product.Status.DRAFT,
+        )
+
+        ProductAuditLog.objects.create(
+            product=self.product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.SUBMITTED,
+            previous_status=Product.Status.DRAFT,
+            new_status=Product.Status.UNDER_REVIEW,
+        )
+
+        ProductAuditLog.objects.create(
+            product=other_product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.SUBMITTED,
+            previous_status=Product.Status.DRAFT,
+            new_status=Product.Status.UNDER_REVIEW,
+        )
+
+        response = self.client.get(
+            f"/api/products/{self.product.id}/audit-history/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(
+            response.data["results"][0]["product"],
+            self.product.id,
+        )
+
+    def test_product_audit_history_orders_newest_first(self):
+        older = ProductAuditLog.objects.create(
+            product=self.product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.SUBMITTED,
+            previous_status=Product.Status.DRAFT,
+            new_status=Product.Status.UNDER_REVIEW,
+        )
+
+        newer = ProductAuditLog.objects.create(
+            product=self.product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.APPROVED,
+            previous_status=Product.Status.UNDER_REVIEW,
+            new_status=Product.Status.PUBLISHED,
+        )
+
+        response = self.client.get(
+            f"/api/products/{self.product.id}/audit-history/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            response.data["results"][0]["id"],
+            newer.id,
+        )
+        self.assertEqual(
+            response.data["results"][1]["id"],
+            older.id,
+        )
+
+    def test_customer_cannot_access_product_audit_history(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get(
+            f"/api/products/{self.product.id}/audit-history/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_anonymous_user_cannot_access_product_audit_history(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get(
+            f"/api/products/{self.product.id}/audit-history/"
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+
+class SellerDashboardSummaryAPITests(APITestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+        self.staff_user = User.objects.create_user(
+            username="dashboard_staff",
+            password="DashboardTest123!",
+            is_staff=True,
+        )
+
+        self.customer = User.objects.create_user(
+            username="dashboard_customer",
+            password="DashboardTest123!",
+        )
+
+        self.supplier = Supplier.objects.create(
+            name="Dashboard Supplier",
+        )
+
+        self.category = Category.objects.create(
+            name="Dashboard Category",
+        )
+
+        self.published_product = Product.objects.create(
+            name="Dashboard Published Product",
+            category=self.category,
+            price=Decimal("1000.00"),
+            stock_quantity=10,
+            status=Product.Status.PUBLISHED,
+        )
+
+        self.draft_product = Product.objects.create(
+            name="Dashboard Draft Product",
+            category=self.category,
+            price=Decimal("2000.00"),
+            stock_quantity=2,
+            status=Product.Status.DRAFT,
+        )
+
+        self.review_product = Product.objects.create(
+            name="Dashboard Review Product",
+            category=self.category,
+            price=Decimal("3000.00"),
+            stock_quantity=0,
+            status=Product.Status.UNDER_REVIEW,
+        )
+
+        self.url = "/api/dashboard/summary/"
+        self.client.force_authenticate(user=self.staff_user)
+
+    def test_dashboard_returns_correct_product_and_inventory_summary(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.data["products"],
+            {
+                "total": 3,
+                "published": 1,
+                "drafts": 1,
+                "under_review": 1,
+            },
+        )
+
+        self.assertEqual(
+            response.data["inventory"]["total_units_in_stock"],
+            12,
+        )
+
+        self.assertEqual(
+            response.data["inventory"]["low_stock_products"],
+            2,
+        )
+
+        self.assertEqual(
+            response.data["inventory"]["low_stock_threshold"],
+            5,
+        )
+
+    def test_dashboard_returns_purchase_order_summary(self):
+        PurchaseOrder.objects.create(
+            order_number="DASH-PO-001",
+            supplier=self.supplier,
+            created_by=self.staff_user,
+            status=PurchaseOrder.Status.DRAFT,
+        )
+
+        PurchaseOrder.objects.create(
+            order_number="DASH-PO-002",
+            supplier=self.supplier,
+            created_by=self.staff_user,
+            status=PurchaseOrder.Status.RECEIVED,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.data["purchase_orders"],
+            {
+                "total": 2,
+                "draft": 1,
+                "ordered": 0,
+                "received": 1,
+                "cancelled": 0,
+            },
+        )
+
+    def test_dashboard_returns_recent_product_audit_activity(self):
+        ProductAuditLog.objects.create(
+            product=self.published_product,
+            actor=self.staff_user,
+            action=ProductAuditLog.Action.APPROVED,
+            previous_status=Product.Status.UNDER_REVIEW,
+            new_status=Product.Status.PUBLISHED,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["recent_activity"]), 1)
+
+        activity = response.data["recent_activity"][0]
+
+        self.assertEqual(
+            activity["product"],
+            self.published_product.id,
+        )
+        self.assertEqual(
+            activity["action"],
+            ProductAuditLog.Action.APPROVED,
+        )
+
+    def test_customer_cannot_access_dashboard_summary(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_anonymous_user_cannot_access_dashboard_summary(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 401)
+
+
+
+class SellerProductOwnershipTests(APITestCase):
+    def setUp(self):
+        self.seller_one = User.objects.create_user(
+            username="seller_one",
+            password="SecureTestPass123!",
+        )
+        self.seller_two = User.objects.create_user(
+            username="seller_two",
+            password="SecureTestPass123!",
+        )
+        self.pending_seller = User.objects.create_user(
+            username="pending_seller",
+            password="SecureTestPass123!",
+        )
+        self.suspended_seller = User.objects.create_user(
+            username="suspended_seller",
+            password="SecureTestPass123!",
+        )
+        self.customer = User.objects.create_user(
+            username="regular_customer",
+            password="SecureTestPass123!",
+        )
+        self.admin = User.objects.create_user(
+            username="seller_test_admin",
+            password="SecureTestPass123!",
+            is_staff=True,
+        )
+
+        self.profile_one = SellerProfile.objects.create(
+            user=self.seller_one,
+            business_name="Seller One Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+        self.profile_two = SellerProfile.objects.create(
+            user=self.seller_two,
+            business_name="Seller Two Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.pending_seller,
+            business_name="Pending Store",
+            status=SellerProfile.Status.PENDING,
+        )
+        SellerProfile.objects.create(
+            user=self.suspended_seller,
+            business_name="Suspended Store",
+            status=SellerProfile.Status.SUSPENDED,
+        )
+
+        self.category = Category.objects.create(
+            name="Seller Test Electronics",
+        )
+
+        self.product_one = Product.objects.create(
+            owner=self.seller_one,
+            name="Seller One Keyboard",
+            category=self.category,
+            price="25000.00",
+            stock_quantity=0,
+            status=Product.Status.DRAFT,
+        )
+        self.product_two = Product.objects.create(
+            owner=self.seller_two,
+            name="Seller Two Mouse",
+            category=self.category,
+            price="15000.00",
+            stock_quantity=0,
+            status=Product.Status.DRAFT,
+        )
+
+    def product_payload(self, name="New Seller Product"):
+        return {
+            "name": name,
+            "description": "Created by a marketplace seller",
+            "category_id": self.category.id,
+            "price": "12000.00",
+            "stock_quantity": 50,
+            "status": "PUBLISHED",
+        }
+
+    def test_approved_seller_creates_owned_draft(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.post(
+            "/api/products/",
+            self.product_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        product = Product.objects.get(name="New Seller Product")
+        self.assertEqual(product.owner, self.seller_one)
+        self.assertEqual(product.status, Product.Status.DRAFT)
+        self.assertEqual(product.stock_quantity, 0)
+
+    def test_seller_cannot_update_another_sellers_product(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.patch(
+            f"/api/products/{self.product_two.id}/",
+            {"price": "100.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.product_two.refresh_from_db()
+        self.assertEqual(str(self.product_two.price), "15000.00")
+
+    def test_seller_cannot_delete_another_sellers_product(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.delete(
+            f"/api/products/{self.product_two.id}/",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(
+            Product.objects.filter(pk=self.product_two.pk).exists()
+        )
+
+    def test_approved_seller_can_manage_own_draft(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.get(
+            f"/api/products/{self.product_one.id}/?manage=true"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_pending_seller_cannot_create_product(self):
+        self.client.force_authenticate(user=self.pending_seller)
+
+        response = self.client.post(
+            "/api/products/",
+            self.product_payload("Pending Seller Product"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_suspended_seller_cannot_create_product(self):
+        self.client.force_authenticate(user=self.suspended_seller)
+
+        response = self.client.post(
+            "/api/products/",
+            self.product_payload("Suspended Seller Product"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_cannot_create_product(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.post(
+            "/api/products/",
+            self.product_payload("Customer Product"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_update_another_sellers_product(self):
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.patch(
+            f"/api/products/{self.product_two.id}/",
+            {"price": "18000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.product_two.refresh_from_db()
+        self.assertEqual(str(self.product_two.price), "18000.00")
+
+
+
+class SellerProductWorkflowSecurityTests(APITestCase):
+    def setUp(self):
+        self.seller_one = User.objects.create_user(
+            username="workflow_seller_one",
+            password="SecureTestPass123!",
+        )
+        self.seller_two = User.objects.create_user(
+            username="workflow_seller_two",
+            password="SecureTestPass123!",
+        )
+        self.pending_seller = User.objects.create_user(
+            username="workflow_pending_seller",
+            password="SecureTestPass123!",
+        )
+        self.suspended_seller = User.objects.create_user(
+            username="workflow_suspended_seller",
+            password="SecureTestPass123!",
+        )
+        self.admin = User.objects.create_user(
+            username="workflow_admin",
+            password="SecureTestPass123!",
+            is_staff=True,
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller_one,
+            business_name="Workflow Seller One",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.seller_two,
+            business_name="Workflow Seller Two",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.pending_seller,
+            business_name="Workflow Pending Seller",
+            status=SellerProfile.Status.PENDING,
+        )
+        SellerProfile.objects.create(
+            user=self.suspended_seller,
+            business_name="Workflow Suspended Seller",
+            status=SellerProfile.Status.SUSPENDED,
+        )
+
+        self.category = Category.objects.create(
+            name="Workflow Security Category",
+        )
+
+        self.own_product = Product.objects.create(
+            owner=self.seller_one,
+            name="Seller One Draft",
+            category=self.category,
+            price=Decimal("12000.00"),
+            stock_quantity=0,
+            status=Product.Status.DRAFT,
+        )
+
+        self.other_product = Product.objects.create(
+            owner=self.seller_two,
+            name="Seller Two Draft",
+            category=self.category,
+            price=Decimal("15000.00"),
+            stock_quantity=0,
+            status=Product.Status.DRAFT,
+        )
+
+    def test_approved_seller_can_submit_own_draft(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/submit-review/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.own_product.refresh_from_db()
+        self.assertEqual(
+            self.own_product.status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+        audit = ProductAuditLog.objects.get(
+            product=self.own_product,
+        )
+        self.assertEqual(audit.actor, self.seller_one)
+        self.assertEqual(
+            audit.action,
+            ProductAuditLog.Action.SUBMITTED,
+        )
+        self.assertEqual(audit.previous_status, Product.Status.DRAFT)
+        self.assertEqual(
+            audit.new_status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+    def test_seller_cannot_submit_another_sellers_product(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.post(
+            f"/api/products/{self.other_product.id}/submit-review/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.other_product.refresh_from_db()
+        self.assertEqual(
+            self.other_product.status,
+            Product.Status.DRAFT,
+        )
+        self.assertFalse(
+            ProductAuditLog.objects.filter(
+                product=self.other_product,
+            ).exists()
+        )
+
+    def test_pending_seller_cannot_submit_product(self):
+        self.client.force_authenticate(user=self.pending_seller)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/submit-review/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_suspended_seller_cannot_submit_product(self):
+        self.client.force_authenticate(user=self.suspended_seller)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/submit-review/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_seller_cannot_approve_product(self):
+        self.own_product.status = Product.Status.UNDER_REVIEW
+        self.own_product.save(update_fields=["status", "updated_at"])
+
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/approve/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.own_product.refresh_from_db()
+        self.assertEqual(
+            self.own_product.status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+    def test_seller_cannot_return_product_to_draft(self):
+        self.own_product.status = Product.Status.UNDER_REVIEW
+        self.own_product.save(update_fields=["status", "updated_at"])
+
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/return-to-draft/"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.own_product.refresh_from_db()
+        self.assertEqual(
+            self.own_product.status,
+            Product.Status.UNDER_REVIEW,
+        )
+
+    def test_admin_can_approve_submitted_product(self):
+        self.own_product.status = Product.Status.UNDER_REVIEW
+        self.own_product.save(update_fields=["status", "updated_at"])
+
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            f"/api/products/{self.own_product.id}/approve/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.own_product.refresh_from_db()
+        self.assertEqual(
+            self.own_product.status,
+            Product.Status.PUBLISHED,
+        )
+
+        audit = ProductAuditLog.objects.get(
+            product=self.own_product,
+            action=ProductAuditLog.Action.APPROVED,
+        )
+        self.assertEqual(audit.actor, self.admin)
+
+    def test_seller_cannot_submit_same_product_twice(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        first_response = self.client.post(
+            f"/api/products/{self.own_product.id}/submit-review/"
+        )
+        second_response = self.client.post(
+            f"/api/products/{self.own_product.id}/submit-review/"
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 400)
+        self.assertEqual(
+            ProductAuditLog.objects.filter(
+                product=self.own_product,
+            ).count(),
+            1,
+        )
+
+
+
+class SellerDashboardIsolationTests(APITestCase):
+    def setUp(self):
+        self.seller_one = User.objects.create_user(
+            username="dashboard_seller_one",
+            password="SecureTestPass123!",
+        )
+        self.seller_two = User.objects.create_user(
+            username="dashboard_seller_two",
+            password="SecureTestPass123!",
+        )
+        self.pending_seller = User.objects.create_user(
+            username="dashboard_pending_seller",
+            password="SecureTestPass123!",
+        )
+        self.suspended_seller = User.objects.create_user(
+            username="dashboard_suspended_seller",
+            password="SecureTestPass123!",
+        )
+        self.customer = User.objects.create_user(
+            username="dashboard_regular_customer",
+            password="SecureTestPass123!",
+        )
+        self.admin = User.objects.create_user(
+            username="dashboard_admin",
+            password="SecureTestPass123!",
+            is_staff=True,
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller_one,
+            business_name="Dashboard Isolation Store One",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.seller_two,
+            business_name="Dashboard Isolation Store Two",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.pending_seller,
+            business_name="Dashboard Pending Store",
+            status=SellerProfile.Status.PENDING,
+        )
+        SellerProfile.objects.create(
+            user=self.suspended_seller,
+            business_name="Dashboard Suspended Store",
+            status=SellerProfile.Status.SUSPENDED,
+        )
+
+        self.category = Category.objects.create(
+            name="Dashboard Isolation Category",
+        )
+        self.url = "/api/seller/dashboard/"
+
+        Product.objects.create(
+            owner=self.seller_one,
+            name="Seller One Published",
+            category=self.category,
+            price=Decimal("1000.00"),
+            stock_quantity=8,
+            status=Product.Status.PUBLISHED,
+        )
+        Product.objects.create(
+            owner=self.seller_one,
+            name="Seller One Draft",
+            category=self.category,
+            price=Decimal("2000.00"),
+            stock_quantity=2,
+            status=Product.Status.DRAFT,
+        )
+        Product.objects.create(
+            owner=self.seller_one,
+            name="Seller One Under Review",
+            category=self.category,
+            price=Decimal("3000.00"),
+            stock_quantity=0,
+            status=Product.Status.UNDER_REVIEW,
+        )
+        Product.objects.create(
+            owner=self.seller_two,
+            name="Seller Two Published",
+            category=self.category,
+            price=Decimal("4000.00"),
+            stock_quantity=50,
+            status=Product.Status.PUBLISHED,
+        )
+
+    def test_dashboard_counts_only_own_products(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["business_name"],
+            "Dashboard Isolation Store One",
+        )
+        self.assertEqual(
+            response.data["products"],
+            {
+                "total": 3,
+                "published": 1,
+                "drafts": 1,
+                "under_review": 1,
+            },
+        )
+        self.assertEqual(
+            response.data["inventory"]["total_units_in_stock"],
+            10,
+        )
+        self.assertEqual(
+            response.data["inventory"]["low_stock_products"],
+            2,
+        )
+
+    def test_dashboard_does_not_include_another_sellers_stock(self):
+        self.client.force_authenticate(user=self.seller_one)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(
+            response.data["inventory"]["total_units_in_stock"],
+            60,
+        )
+        self.assertEqual(
+            response.data["inventory"]["total_units_in_stock"],
+            10,
+        )
+
+    def test_second_seller_gets_separate_summary(self):
+        self.client.force_authenticate(user=self.seller_two)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["products"]["total"],
+            1,
+        )
+        self.assertEqual(
+            response.data["products"]["published"],
+            1,
+        )
+        self.assertEqual(
+            response.data["inventory"]["total_units_in_stock"],
+            50,
+        )
+        self.assertEqual(
+            response.data["inventory"]["low_stock_products"],
+            0,
+        )
+
+    def test_pending_seller_is_denied(self):
+        self.client.force_authenticate(user=self.pending_seller)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_suspended_seller_is_denied(self):
+        self.client.force_authenticate(user=self.suspended_seller)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_regular_customer_is_denied(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_anonymous_user_is_denied(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_uses_global_dashboard_instead(self):
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+class CustomerOrderAPITests(APITestCase):
+    def setUp(self):
+        self.customer = User.objects.create_user(
+            username="checkout_customer",
+            password="CustomerPass123!",
+        )
+
+        self.other_customer = User.objects.create_user(
+            username="other_checkout_customer",
+            password="CustomerPass123!",
+        )
+
+        self.seller = User.objects.create_user(
+            username="checkout_seller",
+            password="SellerPass123!",
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller,
+            business_name="Checkout Test Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+
+        self.category = Category.objects.create(name="Checkout Food")
+
+        self.product = Product.objects.create(
+            owner=self.seller,
+            category=self.category,
+            name="Test Rice",
+            description="Rice for checkout tests",
+            price=Decimal("2500.00"),
+            stock_quantity=20,
+            status=Product.Status.PUBLISHED,
+        )
+
+        self.checkout_url = "/api/checkout/"
+        self.orders_url = "/api/customer/orders/"
+
+        self.client.force_authenticate(user=self.customer)
+
+    def test_customer_can_checkout_and_stock_is_deducted(self):
+        response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 3,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        order = CustomerOrder.objects.get(
+            order_number=response.data["order_number"]
+        )
+
+        self.assertEqual(order.customer, self.customer)
+        self.assertEqual(order.total_amount, Decimal("7500.00"))
+        self.assertEqual(order.items.count(), 1)
+
+        item = order.items.get()
+        self.assertEqual(item.product, self.product)
+        self.assertEqual(item.seller, self.seller)
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(item.unit_price, Decimal("2500.00"))
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 17)
+
+        movement = InventoryMovement.objects.get(
+            product=self.product,
+            movement_type=InventoryMovement.MovementType.STOCK_OUT,
+        )
+        self.assertEqual(movement.quantity, 3)
+        self.assertEqual(movement.created_by, self.customer)
+
+    def test_client_cannot_set_order_price_or_total(self):
+        response = self.client.post(
+            self.checkout_url,
+            {
+                "total_amount": "1.00",
+                "status": "DELIVERED",
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 2,
+                        "unit_price": "0.01",
+                        "seller": self.other_customer.id,
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        order = CustomerOrder.objects.get(
+            order_number=response.data["order_number"]
+        )
+        self.assertEqual(order.total_amount, Decimal("5000.00"))
+
+        item = order.items.get()
+        self.assertEqual(item.unit_price, Decimal("2500.00"))
+        self.assertEqual(item.seller, self.seller)
+        self.assertEqual(order.status, CustomerOrder.Status.PENDING)
+
+    def test_checkout_rejects_insufficient_stock_without_changes(self):
+        response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 999,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.assertEqual(InventoryMovement.objects.count(), 0)
+
+    def test_checkout_rejects_unpublished_product(self):
+        self.product.status = Product.Status.DRAFT
+        self.product.save(update_fields=["status"])
+
+        response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 1,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+
+    def test_customer_can_list_only_their_own_orders(self):
+        own_order = CustomerOrder.objects.create(
+            order_number="CO-OWN-TEST-001",
+            customer=self.customer,
+            total_amount=Decimal("2500.00"),
+        )
+
+        CustomerOrderItem.objects.create(
+            order=own_order,
+            product=self.product,
+            seller=self.seller,
+            quantity=1,
+            unit_price=Decimal("2500.00"),
+        )
+
+        CustomerOrder.objects.create(
+            order_number="CO-OTHER-TEST-001",
+            customer=self.other_customer,
+            total_amount=Decimal("5000.00"),
+        )
+
+        response = self.client.get(self.orders_url)
+
+        self.assertEqual(response.status_code, 200)
+
+        order_numbers = [
+            item["order_number"]
+            for item in response.data["results"]
+        ]
+        self.assertEqual(order_numbers, ["CO-OWN-TEST-001"])
+ 
+    def test_customer_cannot_retrieve_another_customers_order(self):
+        other_order = CustomerOrder.objects.create(
+            order_number="CO-PRIVATE-TEST-001",
+            customer=self.other_customer,
+            total_amount=Decimal("2500.00"),
+        )
+
+        response = self.client.get(
+            f"{self.orders_url}{other_order.id}/"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unauthenticated_customer_cannot_checkout(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 1,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+    
+    def test_customer_can_cancel_own_order_and_restore_stock(self):
+        checkout_response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 3,
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(checkout_response.status_code, 201)
+
+        order = CustomerOrder.objects.get(
+            order_number=checkout_response.data["order_number"]
+        )
+        cancel_url = f"/api/customer/orders/{order.id}/cancel/"
+
+        response = self.client.post(cancel_url)
+
+        self.assertEqual(response.status_code, 200)
+
+        order.refresh_from_db()
+        self.product.refresh_from_db()
+        item = order.items.get()
+
+        self.assertEqual(order.status, CustomerOrder.Status.CANCELLED)
+        self.assertEqual(
+            item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.CANCELLED,
+        )
+        self.assertEqual(self.product.stock_quantity, 20)
+
+        movement = InventoryMovement.objects.get(
+            product=self.product,
+            movement_type=InventoryMovement.MovementType.STOCK_IN,
+        )
+        self.assertEqual(movement.quantity, 3)
+        self.assertEqual(movement.created_by, self.customer)
+
+    def test_customer_cannot_cancel_another_customers_order(self):
+        order = CustomerOrder.objects.create(
+            order_number="CO-CANCEL-OTHER-001",
+            customer=self.other_customer,
+            total_amount=Decimal("2500.00"),
+        )
+        CustomerOrderItem.objects.create(
+            order=order,
+            product=self.product,
+            seller=self.seller,
+            quantity=1,
+            unit_price=Decimal("2500.00"),
+        )
+
+        response = self.client.post(
+            f"/api/customer/orders/{order.id}/cancel/"
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                product=self.product
+            ).count(),
+            0,
+        )
+
+    def test_customer_cannot_cancel_order_after_processing_starts(self):
+        order = CustomerOrder.objects.create(
+            order_number="CO-CANCEL-PROCESSING-001",
+            customer=self.customer,
+            total_amount=Decimal("2500.00"),
+        )
+        CustomerOrderItem.objects.create(
+            order=order,
+            product=self.product,
+            seller=self.seller,
+            quantity=2,
+            unit_price=Decimal("2500.00"),
+            fulfillment_status=(
+                CustomerOrderItem.FulfillmentStatus.PROCESSING
+            ),
+        )
+
+        response = self.client.post(
+            f"/api/customer/orders/{order.id}/cancel/"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.product.refresh_from_db()
+        order.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(order.status, CustomerOrder.Status.PENDING)
+        self.assertEqual(InventoryMovement.objects.count(), 0)
+
+    def test_customer_cannot_cancel_same_order_twice(self):
+        checkout_response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 2,
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(checkout_response.status_code, 201)
+
+        order = CustomerOrder.objects.get(
+            order_number=checkout_response.data["order_number"]
+        )
+        cancel_url = f"/api/customer/orders/{order.id}/cancel/"
+
+        first_response = self.client.post(cancel_url)
+        second_response = self.client.post(cancel_url)
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 400)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                product=self.product,
+                movement_type=InventoryMovement.MovementType.STOCK_IN,
+            ).count(),
+            1,
+        )
+
+    def test_unauthenticated_customer_cannot_cancel_order(self):
+        order = CustomerOrder.objects.create(
+            order_number="CO-CANCEL-ANON-001",
+            customer=self.customer,
+            total_amount=Decimal("2500.00"),
+        )
+        CustomerOrderItem.objects.create(
+            order=order,
+            product=self.product,
+            seller=self.seller,
+            quantity=1,
+            unit_price=Decimal("2500.00"),
+        )
+
+        self.client.force_authenticate(user=None)
+
+        response = self.client.post(
+            f"/api/customer/orders/{order.id}/cancel/"
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+
+
+
+class SellerOrderManagementTests(APITestCase):
+    def setUp(self):
+        self.customer = User.objects.create_user(
+            username="order_customer",
+            password="CustomerPass123!",
+        )
+        self.seller = User.objects.create_user(
+            username="order_seller",
+            password="SellerPass123!",
+        )
+        self.other_seller = User.objects.create_user(
+            username="other_order_seller",
+            password="SellerPass123!",
+        )
+        self.unapproved_seller = User.objects.create_user(
+            username="pending_order_seller",
+            password="SellerPass123!",
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller,
+            business_name="Approved Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.other_seller,
+            business_name="Other Approved Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+        SellerProfile.objects.create(
+            user=self.unapproved_seller,
+            business_name="Pending Store",
+            status=SellerProfile.Status.PENDING,
+        )
+
+        category = Category.objects.create(name="Order Management Food")
+
+        self.product = Product.objects.create(
+            owner=self.seller,
+            category=category,
+            name="Seller Rice",
+            description="Rice for seller order tests",
+            price=Decimal("1000.00"),
+            stock_quantity=10,
+            status=Product.Status.PUBLISHED,
+        )
+        self.other_product = Product.objects.create(
+            owner=self.other_seller,
+            category=category,
+            name="Other Seller Rice",
+            description="Rice owned by another seller",
+            price=Decimal("1500.00"),
+            stock_quantity=8,
+            status=Product.Status.PUBLISHED,
+        )
+
+        self.order = CustomerOrder.objects.create(
+            order_number="CO-SELLER-TEST-001",
+            customer=self.customer,
+            total_amount=Decimal("2000.00"),
+        )
+        self.item = CustomerOrderItem.objects.create(
+            order=self.order,
+            product=self.product,
+            seller=self.seller,
+            quantity=2,
+            unit_price=Decimal("1000.00"),
+        )
+        self.other_order = CustomerOrder.objects.create(
+            order_number="CO-SELLER-TEST-002",
+            customer=self.customer,
+            total_amount=Decimal("1500.00"),
+        )
+        self.other_item = CustomerOrderItem.objects.create(
+            order=self.other_order,
+            product=self.other_product,
+            seller=self.other_seller,
+            quantity=1,
+            unit_price=Decimal("1500.00"),
+        )
+
+        self.list_url = "/api/seller/orders/"
+        self.status_url = (
+            f"/api/seller/orders/{self.item.id}/status/"
+        )
+
+        self.client.force_authenticate(user=self.seller)
+
+    def test_seller_list_contains_only_own_order_items(self):
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+        results = response.data.get("results", response.data)
+        item_ids = [row["id"] for row in results]
+
+        self.assertIn(self.item.id, item_ids)
+        self.assertNotIn(self.other_item.id, item_ids)
+
+    def test_seller_cannot_retrieve_another_sellers_item(self):
+        response = self.client.get(
+            f"/api/seller/orders/{self.other_item.id}/"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_seller_cannot_update_another_sellers_item(self):
+        response = self.client.patch(
+            f"/api/seller/orders/{self.other_item.id}/status/",
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.other_item.refresh_from_db()
+        self.assertEqual(
+            self.other_item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.PENDING,
+        )
+
+    def test_seller_can_confirm_order_item(self):
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.item.refresh_from_db()
+        self.assertEqual(
+            self.item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.CONFIRMED,
+        )
+
+    def test_invalid_status_transition_is_rejected(self):
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "DELIVERED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.item.refresh_from_db()
+        self.assertEqual(
+            self.item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.PENDING,
+        )
+
+    def test_cancellation_restores_stock_and_records_movement(self):
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CANCELLED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.product.refresh_from_db()
+        self.item.refresh_from_db()
+
+        self.assertEqual(self.product.stock_quantity, 12)
+        self.assertEqual(
+            self.item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.CANCELLED,
+        )
+
+        movement = InventoryMovement.objects.get(
+            product=self.product,
+            movement_type=InventoryMovement.MovementType.STOCK_IN,
+        )
+        self.assertEqual(movement.quantity, 2)
+        self.assertEqual(movement.created_by, self.seller)
+
+    def test_cancelled_item_cannot_restore_stock_twice(self):
+        first_response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CANCELLED"},
+            format="json",
+        )
+        self.assertEqual(first_response.status_code, 200)
+
+        second_response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CANCELLED"},
+            format="json",
+        )
+        self.assertEqual(second_response.status_code, 400)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 12)
+
+        movements = InventoryMovement.objects.filter(
+            product=self.product,
+            movement_type=InventoryMovement.MovementType.STOCK_IN,
+        )
+        self.assertEqual(movements.count(), 1)
+
+    def test_unapproved_seller_cannot_update_order_status(self):
+        self.client.force_authenticate(user=self.unapproved_seller)
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_unauthenticated_user_cannot_update_order_status(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        
+    def test_order_status_updates_when_all_items_are_delivered(self):
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "PROCESSING"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "SHIPPED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "DELIVERED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.order.refresh_from_db()
+        self.assertEqual(
+            self.order.status,
+            CustomerOrder.Status.DELIVERED,
+        )
+
+    def test_order_remains_pending_while_another_item_is_pending(self):
+        second_item = CustomerOrderItem.objects.create(
+            order=self.order,
+            product=self.other_product,
+            seller=self.other_seller,
+            quantity=1,
+            unit_price=Decimal("1500.00"),
+        )
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CONFIRMED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.order.refresh_from_db()
+        self.assertEqual(
+            self.order.status,
+            CustomerOrder.Status.PENDING,
+        )
+        
+    def test_cancelling_one_item_does_not_cancel_order_with_active_items(self):
+        second_item = CustomerOrderItem.objects.create(
+            order=self.order,
+            product=self.other_product,
+            seller=self.other_seller,
+            quantity=1,
+            unit_price=Decimal("1500.00"),
+        )
+
+        response = self.client.patch(
+            self.status_url,
+            {"fulfillment_status": "CANCELLED"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.order.refresh_from_db()
+        second_item.refresh_from_db()
+
+        self.assertEqual(
+            self.order.status,
+            CustomerOrder.Status.PENDING,
+        )
+        self.assertEqual(
+            second_item.fulfillment_status,
+            CustomerOrderItem.FulfillmentStatus.PENDING,
+        )

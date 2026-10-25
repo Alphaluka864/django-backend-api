@@ -16,7 +16,20 @@ class Category(models.Model):
         return self.name
 
 
+
 class Product(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        UNDER_REVIEW = "UNDER_REVIEW", "Under Review"
+        PUBLISHED = "PUBLISHED", "Published"
+        
+    owner = models.ForeignKey(
+        "auth.User",
+        on_delete=models.PROTECT,
+        related_name="owned_products",
+        null=True,
+        blank=True,
+    )
     category = models.ForeignKey(
         Category,
         on_delete=models.PROTECT,
@@ -28,12 +41,59 @@ class Product(models.Model):
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2)
     stock_quantity = models.PositiveIntegerField(default=0)
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PUBLISHED,
+        db_index=True,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.name
 
+class ProductAuditLog(models.Model):
+    class Action(models.TextChoices):
+        SUBMITTED = "SUBMITTED", "Submitted for review"
+        APPROVED = "APPROVED", "Approved"
+        RETURNED = "RETURNED", "Returned to draft"
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="audit_logs",
+    )
+
+    actor = models.ForeignKey(
+        "auth.User",
+        on_delete=models.PROTECT,
+        related_name="product_audit_logs",
+    )
+
+    action = models.CharField(
+        max_length=20,
+        choices=Action.choices,
+    )
+
+    previous_status = models.CharField(max_length=20)
+    new_status = models.CharField(max_length=20)
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return (
+            f"{self.product.name}: {self.action} "
+            f"by {self.actor.username}"
+        )
 
 
 class InventoryMovement(models.Model):
@@ -182,5 +242,152 @@ class PurchaseOrderItem(models.Model):
     def __str__(self):
         return (
             f"{self.purchase_order.order_number} - "
+            f"{self.product.name} x {self.quantity}"
+        )
+        
+class SellerProfile(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending Approval"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        SUSPENDED = "SUSPENDED", "Suspended"
+
+    user = models.OneToOneField(
+        "auth.User",
+        on_delete=models.CASCADE,
+        related_name="seller_profile",
+    )
+
+    business_name = models.CharField(
+        max_length=200,
+        unique=True,
+    )
+
+    description = models.TextField(blank=True)
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.business_name} ({self.status})"
+    
+
+class CustomerOrder(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        CONFIRMED = "CONFIRMED", "Confirmed"
+        PROCESSING = "PROCESSING", "Processing"
+        SHIPPED = "SHIPPED", "Shipped"
+        DELIVERED = "DELIVERED", "Delivered"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    order_number = models.CharField(
+        max_length=40,
+        unique=True,
+    )
+
+    customer = models.ForeignKey(
+        "auth.User",
+        on_delete=models.PROTECT,
+        related_name="customer_orders",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+
+    total_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.order_number
+
+
+class CustomerOrderItem(models.Model):
+    order = models.ForeignKey(
+        CustomerOrder,
+        on_delete=models.PROTECT,
+        related_name="items",
+    )
+    class FulfillmentStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        CONFIRMED = "CONFIRMED", "Confirmed"
+        PROCESSING = "PROCESSING", "Processing"
+        SHIPPED = "SHIPPED", "Shipped"
+        DELIVERED = "DELIVERED", "Delivered"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="customer_order_items",
+    )
+
+    seller = models.ForeignKey(
+        "auth.User",
+        on_delete=models.PROTECT,
+        related_name="seller_order_items",
+    )
+    
+    fulfillment_status = models.CharField(
+        max_length=20,
+        choices=FulfillmentStatus.choices,
+        default=FulfillmentStatus.PENDING,
+        db_index=True,
+    )
+
+    quantity = models.PositiveIntegerField()
+
+    unit_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order", "product"],
+                name="unique_product_per_customer_order",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0),
+                name="customer_order_item_quantity_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(unit_price__gt=0),
+                name="customer_order_item_price_gt_zero",
+            ),
+        ]
+
+    @property
+    def line_total(self):
+        return self.quantity * self.unit_price
+
+    def __str__(self):
+        return (
+            f"{self.order.order_number} - "
             f"{self.product.name} x {self.quantity}"
         )

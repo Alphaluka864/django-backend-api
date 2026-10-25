@@ -1,50 +1,33 @@
-.venv/
-.env
-__pycache__/
-*.py[cod]
-
-
-# Environment and secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
-# Python environments and generated files
+# Python environments
 .venv/
 venv/
+
+# Python cache and compiled files
 __pycache__/
 *.py[cod]
+
+# Databases and database backups
 *.sqlite3
+*.dump
+*.sql
+*.backup
 
 # Test and coverage artifacts
 .coverage
 htmlcov/
 .pytest_cache/
 
-# Editor and operating-system files
+# IDE and editor files
 .vscode/
 .idea/
+
+# Operating system files
 .DS_Store
 
-# Environment and secrets
-.env
-.env.*
-!.env.example
-
-# Python environments and generated files
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-*.sqlite3
-
-# Test and coverage artifacts
-.coverage
-htmlcov/
-.pytest_cache/
-
-# Editor and operating-system files
-.vscode/
-.idea/
-.DS_Store
+# Local backups
 products/views.py.backup

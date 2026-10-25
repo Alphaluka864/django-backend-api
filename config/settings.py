@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from datetime import timedelta
 
 
 # --------------------------------------------------
@@ -60,6 +61,7 @@ INSTALLED_APPS = [
     # Local applications
     "products",
     'django_filters',
+    "rest_framework_simplejwt.token_blacklist",
 ]
 
 
@@ -140,6 +142,11 @@ if not DATABASES["default"]["PASSWORD"]:
 # 9. Django REST Framework configuration
 # --------------------------------------------------
 
+
+# --------------------------------------------------
+# 9. Django REST Framework configuration
+# --------------------------------------------------
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -156,8 +163,54 @@ REST_FRAMEWORK = {
         "rest_framework.pagination.PageNumberPagination"
     ),
     "PAGE_SIZE": 10,
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "5/minute",
+        "registration": "3/hour",
+        "token_refresh": "10/minute",
+    },
 }
 
+
+# --------------------------------------------------
+# 9A. Environment-aware cache configuration
+# --------------------------------------------------
+
+DJANGO_CACHE_URL = os.getenv("DJANGO_CACHE_URL", "").strip()
+
+if DJANGO_CACHE_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": DJANGO_CACHE_URL,
+            "KEY_PREFIX": os.getenv(
+                "DJANGO_CACHE_KEY_PREFIX",
+                "shop_api",
+            ),
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                "SOCKET_CONNECT_TIMEOUT": 2,
+                "SOCKET_TIMEOUT": 2,
+            },
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": (
+                "django.core.cache.backends.locmem.LocMemCache"
+            ),
+            "LOCATION": "shop-api-throttle-cache",
+        }
+    }
+
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": False,
+    "UPDATE_LAST_LOGIN": False,
+}
 
 # --------------------------------------------------
 # 10. Password validation

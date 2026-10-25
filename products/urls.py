@@ -1,4 +1,3 @@
-
 from django.urls import path
 
 from .views import (
@@ -19,7 +18,22 @@ from .views import (
     PurchaseOrderReceiveView,
     PurchaseOrderCancelView,
     PurchaseOrderSummaryView,
-    
+    ProductWorkflowActionView,
+    ProductReviewQueueView,
+    ProductAuditLogListView,
+    ProductAuditHistoryView,
+    SellerDashboardSummaryView,
+    SellerDashboardView,
+    SellerApplicationView,
+    AdminSellerApplicationListView,
+    AdminSellerApplicationReviewView,
+    CustomerCheckoutView,
+    CustomerOrderListView,
+    CustomerOrderDetailView,
+    SellerOrderListView,
+    SellerOrderDetailView,
+    SellerOrderStatusUpdateView,
+    CustomerOrderCancelView,
 )
 
 urlpatterns = [
@@ -40,6 +54,7 @@ urlpatterns = [
         UserRegistrationView.as_view(),
         name="user-register",
     ),
+
     path(
         "inventory/movements/",
         InventoryMovementCreateView.as_view(),
@@ -60,27 +75,30 @@ urlpatterns = [
         low_stock_products,
         name="low-stock-products",
     ),
+
     path(
-    "categories/",
-    CategoryListCreateView.as_view(),
-    name="category-list-create",
+        "categories/",
+        CategoryListCreateView.as_view(),
+        name="category-list-create",
     ),
+
     path(
-    "suppliers/",
-    SupplierListCreateView.as_view(),
-    name="supplier-list-create",
+        "suppliers/",
+        SupplierListCreateView.as_view(),
+        name="supplier-list-create",
     ),
     path(
         "suppliers/<int:pk>/",
         SupplierDetailView.as_view(),
         name="supplier-detail",
     ),
+
     path(
-    "purchase-orders/",
-    PurchaseOrderListCreateView.as_view(),
-    name="purchase-order-list-create",
+        "purchase-orders/",
+        PurchaseOrderListCreateView.as_view(),
+        name="purchase-order-list-create",
     ),
-        path(
+    path(
         "purchase-orders/summary/",
         PurchaseOrderSummaryView.as_view(),
         name="purchase-order-summary",
@@ -91,9 +109,9 @@ urlpatterns = [
         name="purchase-order-detail",
     ),
     path(
-    "purchase-orders/<int:pk>/order/",
-    PurchaseOrderMarkOrderedView.as_view(),
-    name="purchase-order-mark-ordered",
+        "purchase-orders/<int:pk>/order/",
+        PurchaseOrderMarkOrderedView.as_view(),
+        name="purchase-order-mark-ordered",
     ),
     path(
         "purchase-orders/<int:pk>/receive/",
@@ -101,8 +119,103 @@ urlpatterns = [
         name="purchase-order-receive",
     ),
     path(
-    "purchase-orders/<int:pk>/cancel/",
-    PurchaseOrderCancelView.as_view(),
-    name="purchase-order-cancel",
+        "purchase-orders/<int:pk>/cancel/",
+        PurchaseOrderCancelView.as_view(),
+        name="purchase-order-cancel",
+    ),
+
+    path(
+        "products/<int:pk>/submit-review/",
+        ProductWorkflowActionView.as_view(),
+        {"action": "submit-review"},
+        name="product-submit-review",
+    ),
+    path(
+        "products/<int:pk>/approve/",
+        ProductWorkflowActionView.as_view(),
+        {"action": "approve"},
+        name="product-approve",
+    ),
+    path(
+        "products/<int:pk>/return-to-draft/",
+        ProductWorkflowActionView.as_view(),
+        {"action": "return-to-draft"},
+        name="product-return-to-draft",
+    ),
+    path(
+        "products/review-queue/",
+        ProductReviewQueueView.as_view(),
+        name="product-review-queue",
+    ),
+
+    path(
+        "product-audit-logs/",
+        ProductAuditLogListView.as_view(),
+        name="product-audit-logs",
+    ),
+    path(
+        "products/<int:pk>/audit-history/",
+        ProductAuditHistoryView.as_view(),
+        name="product-audit-history",
+    ),
+    path(
+        "dashboard/summary/",
+        SellerDashboardSummaryView.as_view(),
+        name="dashboard-summary",
+    ),
+    path(
+        "seller/dashboard/",
+        SellerDashboardView.as_view(),
+        name="seller-dashboard",
+    ),
+    path(
+        "seller/apply/",
+        SellerApplicationView.as_view(),
+        name="seller-apply",
+    ),
+    path(
+        "admin/seller-applications/",
+        AdminSellerApplicationListView.as_view(),
+        name="admin-seller-application-list",
+    ),
+    path(
+        "admin/seller-applications/<int:pk>/review/",
+        AdminSellerApplicationReviewView.as_view(),
+        name="admin-seller-application-review",
+    ),
+    path(
+        "checkout/",
+        CustomerCheckoutView.as_view(),
+        name="customer-checkout",
+    ),
+    path(
+        "customer/orders/",
+        CustomerOrderListView.as_view(),
+        name="customer-order-list",
+    ),
+    path(
+        "customer/orders/<int:pk>/",
+        CustomerOrderDetailView.as_view(),
+        name="customer-order-detail",
+    ),
+    path(
+        "seller/orders/",
+        SellerOrderListView.as_view(),
+        name="seller-order-list",
+    ),
+    path(
+        "seller/orders/<int:pk>/",
+        SellerOrderDetailView.as_view(),
+        name="seller-order-detail",
+    ),
+    path(
+        "seller/orders/<int:pk>/status/",
+        SellerOrderStatusUpdateView.as_view(),
+        name="seller-order-status-update",
+    ),
+    path(
+        "customer/orders/<int:pk>/cancel/",
+        CustomerOrderCancelView.as_view(),
+        name="customer-order-cancel",
     ),
 ]

@@ -1,31 +1,36 @@
 
+from decimal import Decimal
+import secrets
+
+from django.contrib.auth.models import User
+from django.db import transaction
+
 from rest_framework import serializers
+from django.contrib.auth.password_validation import validate_password
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
+
 from .models import (
     Product,
     Category,
     InventoryMovement,
     Supplier,
     SellerProfile,
+    PurchaseOrder,
+    PurchaseOrderItem,
+    ProductAuditLog,
     CustomerOrder,
     CustomerOrderItem,
 )
-from django.contrib.auth.models import User
 
-from django.db import transaction
-from rest_framework import serializers
-from .models import PurchaseOrder, PurchaseOrderItem,ProductAuditLog
-from django.contrib.auth.password_validation import validate_password
-import secrets
-from decimal import Decimal
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = ["id", "name", "description", "created_at"]
         read_only_fields = ["id", "created_at"]
-        
-        
-        
+
 
 class ProductSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
@@ -36,6 +41,7 @@ class ProductSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+
     def validate_status(self, value):
         if self.instance is not None:
             raise serializers.ValidationError(
@@ -64,8 +70,6 @@ class ProductSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-
-
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -100,12 +104,10 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data.pop("password2")
 
-        user = User.objects.create_user(
+        return User.objects.create_user(
             username=validated_data["username"],
             password=validated_data["password"],
         )
-
-        return user
 
 
 class SellerApplicationSerializer(serializers.ModelSerializer):
@@ -157,8 +159,6 @@ class SellerApplicationSerializer(serializers.ModelSerializer):
         )
 
 
-
-
 class InventoryMovementSerializer(serializers.ModelSerializer):
     product_id = serializers.IntegerField(write_only=True)
     product_name = serializers.CharField(
@@ -188,6 +188,27 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def validate_movement_type(self, value):
+        allowed_types = [
+            InventoryMovement.MovementType.STOCK_IN,
+            InventoryMovement.MovementType.STOCK_OUT,
+        ]
+
+        if value not in allowed_types:
+            raise serializers.ValidationError(
+                "Movement type must be IN or OUT."
+            )
+
+        return value
+
+    def validate_product_id(self, value):
+        if not Product.objects.filter(pk=value).exists():
+            raise serializers.ValidationError(
+                "The specified product does not exist."
+            )
+
+        return value
+
     def create(self, validated_data):
         request = self.context["request"]
         product_id = validated_data.pop("product_id")
@@ -209,7 +230,6 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
                 == InventoryMovement.MovementType.STOCK_IN
             ):
                 product.stock_quantity += quantity
-
             else:
                 if quantity > product.stock_quantity:
                     raise serializers.ValidationError({
@@ -234,31 +254,6 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
         return movement
 
 
-
-    def validate_movement_type(self, value):
-        allowed_types = [
-            InventoryMovement.MovementType.STOCK_IN,
-            InventoryMovement.MovementType.STOCK_OUT,
-        ]
-
-        if value not in allowed_types:
-            raise serializers.ValidationError(
-                "Movement type must be IN or OUT."
-            )
-
-        return value
-
-
-    def validate_product_id(self, value):
-        if not Product.objects.filter(pk=value).exists():
-            raise serializers.ValidationError(
-                "The specified product does not exist."
-            )
-
-        return value
-
-
-
 class SupplierSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
@@ -281,7 +276,6 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         source="product.name",
         read_only=True,
     )
-
     line_total = serializers.SerializerMethodField()
 
     class Meta:
@@ -310,23 +304,21 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             )
         return value
 
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_line_total(self, obj):
         return obj.quantity * obj.unit_cost
 
 
 class PurchaseOrderSerializer(serializers.ModelSerializer):
     items = PurchaseOrderItemSerializer(many=True)
-
     supplier_name = serializers.CharField(
         source="supplier.name",
         read_only=True,
     )
-
     created_by_username = serializers.CharField(
         source="created_by.username",
         read_only=True,
     )
-
     total_cost = serializers.SerializerMethodField()
 
     class Meta:
@@ -372,10 +364,14 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
 
         return value
 
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_total_cost(self, obj):
         return sum(
-            (item.quantity * item.unit_cost for item in obj.items.all()),
-            start=0,
+            (
+                item.quantity * item.unit_cost
+                for item in obj.items.all()
+            ),
+            start=Decimal("0.00"),
         )
 
     @transaction.atomic
@@ -393,14 +389,13 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             )
 
         return purchase_order
-    
+
 
 class ProductAuditLogSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
         source="product.name",
         read_only=True,
     )
-
     actor_username = serializers.CharField(
         source="actor.username",
         read_only=True,
@@ -420,7 +415,6 @@ class ProductAuditLogSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields
-
 
 
 class SellerProfileAdminSerializer(serializers.ModelSerializer):
@@ -464,10 +458,6 @@ class SellerProfileAdminSerializer(serializers.ModelSerializer):
         return value
 
 
-
-
-
-
 class CustomerOrderItemInputSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(min_value=1)
     quantity = serializers.IntegerField(min_value=1)
@@ -494,8 +484,10 @@ class CustomerOrderItemSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_line_total(self, obj):
         return obj.line_total
+
 
 class SellerOrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(
@@ -528,6 +520,7 @@ class SellerOrderItemSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    @extend_schema_field(OpenApiTypes.DECIMAL)
     def get_line_total(self, obj):
         return obj.line_total
 
@@ -588,7 +581,9 @@ class CustomerCheckoutSerializer(serializers.Serializer):
             .select_related("owner")
         )
 
-        products_by_id = {product.id: product for product in products}
+        products_by_id = {
+            product.id: product for product in products
+        }
 
         if len(products_by_id) != len(product_ids):
             raise serializers.ValidationError({

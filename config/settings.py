@@ -57,13 +57,13 @@ INSTALLED_APPS = [
 
     # Third-party applications
     "rest_framework",
+    "drf_spectacular",
+    "django_filters",
+    "rest_framework_simplejwt.token_blacklist",
 
     # Local applications
     "products",
-    'django_filters',
-    "rest_framework_simplejwt.token_blacklist",
 ]
-
 
 # --------------------------------------------------
 # 4. Middleware
@@ -151,6 +151,7 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
@@ -169,6 +170,56 @@ REST_FRAMEWORK = {
         "token_refresh": "10/minute",
     },
 }
+
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Shop Backend API",
+    "DESCRIPTION": (
+        "API documentation for the Django shop backend, "
+        "including products, inventory, suppliers, orders, "
+        "seller management, and authentication."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "COMPONENT_SPLIT_REQUEST": True,
+    "APPEND_COMPONENTS": {
+        "securitySchemes": {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+            }
+        }
+    },
+    "ENUM_NAME_OVERRIDES": {
+        "ProductStatusEnum": [
+            ("DRAFT", "Draft"),
+            ("UNDER_REVIEW", "Under Review"),
+            ("PUBLISHED", "Published"),
+        ],
+        "PurchaseOrderStatusEnum": [
+            ("DRAFT", "Draft"),
+            ("ORDERED", "Ordered"),
+            ("RECEIVED", "Received"),
+            ("CANCELLED", "Cancelled"),
+        ],
+        "SellerProfileStatusEnum": [
+            ("PENDING", "Pending Approval"),
+            ("APPROVED", "Approved"),
+            ("REJECTED", "Rejected"),
+            ("SUSPENDED", "Suspended"),
+        ],
+        "CustomerOrderStatusEnum": [
+            ("PENDING", "Pending"),
+            ("CONFIRMED", "Confirmed"),
+            ("PROCESSING", "Processing"),
+            ("SHIPPED", "Shipped"),
+            ("DELIVERED", "Delivered"),
+            ("CANCELLED", "Cancelled"),
+        ],
+    },
+}
+
 
 
 # --------------------------------------------------

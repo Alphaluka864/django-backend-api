@@ -54,9 +54,11 @@ from .serializers import (
 )
 from .models import CustomerOrder, CustomerOrderItem
 from django.db import transaction
+from drf_spectacular.utils import extend_schema, OpenApiTypes
 
-
-
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+)
 @api_view(["GET"])
 @permission_classes([permissions.AllowAny])
 def health_check(request):
@@ -186,6 +188,7 @@ class ProductWorkflowActionView(APIView):
             ProductAuditLog.Action.RETURNED,
         ),
     }
+    @extend_schema(request=None, responses={200: OpenApiTypes.OBJECT})
 
     def post(self, request, pk, action):
         if action not in self.transitions:
@@ -331,6 +334,9 @@ class ProductAuditHistoryView(ListAPIView):
     permission_classes = [IsAdminUser]
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return ProductAuditLog.objects.none()
+
         return (
             ProductAuditLog.objects
             .filter(product_id=self.kwargs["pk"])
@@ -355,7 +361,7 @@ class SellerApplicationView(generics.CreateAPIView):
     def perform_create(self, serializer):
         serializer.save()
 
- 
+
 class AdminSellerApplicationListView(generics.ListAPIView):
     serializer_class = SellerProfileAdminSerializer
     permission_classes = [permissions.IsAdminUser]
@@ -376,7 +382,7 @@ class AdminSellerApplicationReviewView(generics.UpdateAPIView):
     permission_classes = [permissions.IsAdminUser]
     queryset = SellerProfile.objects.select_related("user")
     http_method_names = ["patch", "head", "options"]
-  
+
 
 class InventoryMovementCreateView(generics.CreateAPIView):
     queryset = InventoryMovement.objects.all()
@@ -435,7 +441,9 @@ class InventoryMovementListView(generics.ListAPIView):
 
 
 
-
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+)
 @api_view(["GET"])
 @permission_classes([IsAdminUser])
 def inventory_summary(request):
@@ -485,7 +493,9 @@ def inventory_summary(request):
         "inventory": results,
     })
 
-
+@extend_schema(
+    responses={200: OpenApiTypes.OBJECT},
+)
 @api_view(["GET"])
 @permission_classes([IsAdminUser])
 def low_stock_products(request):
@@ -547,6 +557,8 @@ class SupplierDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 class PurchaseOrderSummaryView(APIView):
     permission_classes = [IsAdminUser]
+
+    @extend_schema(responses={200: OpenApiTypes.OBJECT})
 
     def get(self, request):
         # Calculate all status counts in a single database aggregation.
@@ -625,7 +637,7 @@ class PurchaseOrderListCreateView(generics.ListCreateAPIView):
 
             queryset = queryset.filter(status=order_status)
 
-        
+
         # Filter by supplier ID.
         supplier_id = params.get("supplier")
         if supplier_id:
@@ -649,8 +661,8 @@ class PurchaseOrderListCreateView(generics.ListCreateAPIView):
             queryset = queryset.filter(
                 order_number__icontains=order_number
             )
-        
-        
+
+
         # Filter by creation date.
         created_after = params.get("created_after")
         created_before = params.get("created_before")
@@ -723,10 +735,12 @@ class PurchaseOrderDetailView(generics.RetrieveAPIView):
     )
     serializer_class = PurchaseOrderSerializer
     permission_classes = [permissions.IsAdminUser]
-    
-    
+
+
 class PurchaseOrderMarkOrderedView(APIView):
     permission_classes = [permissions.IsAdminUser]
+
+    @extend_schema(request=None, responses={200: OpenApiTypes.OBJECT})
 
     @transaction.atomic
     def post(self, request, pk):
@@ -771,6 +785,8 @@ class PurchaseOrderMarkOrderedView(APIView):
 
 class PurchaseOrderReceiveView(APIView):
     permission_classes = [permissions.IsAdminUser]
+
+    @extend_schema(request=None, responses={200: OpenApiTypes.OBJECT})
 
     @transaction.atomic
     def post(self, request, pk):
@@ -841,6 +857,8 @@ class PurchaseOrderReceiveView(APIView):
 class PurchaseOrderCancelView(APIView):
     permission_classes = [permissions.IsAdminUser]
 
+    @extend_schema(request=None, responses={200: OpenApiTypes.OBJECT})
+
     @transaction.atomic
     def post(self, request, pk):
         try:
@@ -887,6 +905,8 @@ class PurchaseOrderCancelView(APIView):
 
 class SellerDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+
+    @extend_schema(responses={200: OpenApiTypes.OBJECT})
 
     def get(self, request):
         user = request.user
@@ -969,6 +989,8 @@ class SellerDashboardView(APIView):
 class SellerDashboardSummaryView(APIView):
     permission_classes = [IsAdminUser]
 
+    @extend_schema(responses={200: OpenApiTypes.OBJECT})
+
     def get(self, request):
         product_summary = Product.objects.aggregate(
             total=Count("id"),
@@ -1044,6 +1066,10 @@ class SellerDashboardSummaryView(APIView):
 class CustomerCheckoutView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        request=CustomerCheckoutSerializer,
+        responses={201: CustomerOrderSerializer},
+    )
     def post(self, request):
         serializer = CustomerCheckoutSerializer(
             data=request.data,
@@ -1063,6 +1089,9 @@ class CustomerOrderListView(ListAPIView):
     serializer_class = CustomerOrderSerializer
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return CustomerOrder.objects.none()
+
         return (
             CustomerOrder.objects
             .filter(customer=self.request.user)
@@ -1085,6 +1114,11 @@ class CustomerOrderDetailView(RetrieveAPIView):
 
 class CustomerOrderCancelView(APIView):
     permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=None,
+        responses={200: CustomerOrderSerializer},
+    )
 
     def post(self, request, pk):
         with transaction.atomic():
@@ -1169,6 +1203,9 @@ class SellerOrderListView(ListAPIView):
     serializer_class = SellerOrderItemSerializer
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return CustomerOrderItem.objects.none()
+
         return (
             CustomerOrderItem.objects
             .filter(seller=self.request.user)
@@ -1179,7 +1216,7 @@ class SellerOrderListView(ListAPIView):
             )
             .order_by("-order__created_at", "-id")
         )
-        
+
 class SellerOrderDetailView(RetrieveAPIView):
     permission_classes = [IsApprovedSellerOrAdmin]
     serializer_class = SellerOrderItemSerializer
@@ -1217,6 +1254,12 @@ class SellerOrderStatusUpdateView(APIView):
         CustomerOrderItem.FulfillmentStatus.DELIVERED: set(),
         CustomerOrderItem.FulfillmentStatus.CANCELLED: set(),
     }
+
+    @extend_schema(
+        request=SellerOrderStatusUpdateSerializer,
+        responses={200: SellerOrderItemSerializer},
+    )
+
 
     def patch(self, request, pk):
         serializer = SellerOrderStatusUpdateSerializer(

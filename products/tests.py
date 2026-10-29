@@ -1,8 +1,12 @@
-
+import threading
+import time
 from decimal import Decimal
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
+import threading
+from django.db import close_old_connections
+from django.test import skipUnlessDBFeature
 from rest_framework.test import APIClient
 from rest_framework.test import APITestCase
 from .models import (
@@ -3559,6 +3563,47 @@ class CustomerCartAPITests(APITestCase):
 
         self.assertEqual(CustomerOrder.objects.count(), 0)
 
+    def test_checkout_rolls_back_when_inventory_movement_fails(self):
+        from unittest.mock import patch
+
+        self.add_product(quantity=3)
+
+        initial_order_count = CustomerOrder.objects.count()
+        initial_item_count = CustomerOrderItem.objects.count()
+        initial_movement_count = InventoryMovement.objects.count()
+
+        with patch(
+            "products.serializers.InventoryMovement.objects.create",
+            side_effect=RuntimeError("Simulated inventory failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    self.cart_checkout_url,
+                    {},
+                    format="json",
+                )
+
+        # The complete checkout transaction must be rolled back.
+        self.assertEqual(
+            CustomerOrder.objects.count(),
+            initial_order_count,
+        )
+        self.assertEqual(
+            CustomerOrderItem.objects.count(),
+            initial_item_count,
+        )
+        self.assertEqual(
+            InventoryMovement.objects.count(),
+            initial_movement_count,
+        )
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+
+        cart = Cart.objects.get(customer=self.customer)
+        self.assertEqual(cart.items.count(), 1)
+        self.assertEqual(cart.items.get().quantity, 3)
+
     def test_direct_checkout_still_works(self):
         response = self.client.post(
             self.direct_checkout_url,
@@ -3591,3 +3636,158 @@ class CustomerCartAPITests(APITestCase):
         response = self.add_product(quantity=1)
 
         self.assertEqual(response.status_code, 401)
+
+@skipUnlessDBFeature("has_select_for_update")
+class CustomerCartConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        self.customer = User.objects.create_user(
+            username="concurrent_cart_customer",
+            password="CustomerPass123!",
+        )
+
+        self.seller = User.objects.create_user(
+            username="concurrent_cart_seller",
+            password="SellerPass123!",
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller,
+            business_name="Concurrency Test Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+
+        self.category = Category.objects.create(
+            name="Concurrency Test Category",
+        )
+
+        self.product = Product.objects.create(
+            owner=self.seller,
+            category=self.category,
+            name="Concurrency Test Product",
+            description="Product for concurrency tests",
+            price=Decimal("1000.00"),
+            stock_quantity=20,
+            status=Product.Status.PUBLISHED,
+        )
+
+        self.cart = Cart.objects.create(customer=self.customer)
+
+        self.cart_item = CartItem.objects.create(
+            cart=self.cart,
+            product=self.product,
+            quantity=2,
+        )
+
+    def test_update_does_not_resurrect_item_deleted_by_checkout(self):
+        from rest_framework.test import APIClient
+
+        item_id = self.cart_item.pk
+        customer_id = self.customer.pk
+
+        checkout_has_lock = threading.Event()
+        allow_checkout_to_continue = threading.Event()
+        update_finished = threading.Event()
+
+        results = {}
+        errors = []
+
+        def run_checkout():
+            close_old_connections()
+            try:
+                user = User.objects.get(pk=customer_id)
+
+                with transaction.atomic():
+                    cart = Cart.objects.select_for_update().get(
+                        customer=user,
+                    )
+
+                    checkout_has_lock.set()
+
+                    if not allow_checkout_to_continue.wait(timeout=10):
+                        raise TimeoutError(
+                            "Checkout coordination timed out."
+                        )
+
+                    cart_item_ids = list(
+                        cart.items.values_list("id", flat=True),
+                    )
+
+                    if item_id not in cart_item_ids:
+                        raise AssertionError(
+                            "Expected cart item before checkout."
+                        )
+
+                    cart.items.all().delete()
+                    results["checkout_deleted_item"] = True
+
+            except Exception as exc:
+                errors.append(("checkout", repr(exc)))
+                checkout_has_lock.set()
+            finally:
+                close_old_connections()
+
+        def run_update():
+            close_old_connections()
+            try:
+                client = APIClient()
+                user = User.objects.get(pk=customer_id)
+                client.force_authenticate(user=user)
+
+                results["update_response"] = client.patch(
+                    f"/api/cart/items/{item_id}/",
+                    {"quantity": 5},
+                    format="json",
+                ).status_code
+            except Exception as exc:
+                errors.append(("update", repr(exc)))
+                update_finished.set()
+            finally:
+                update_finished.set()
+                close_old_connections()
+
+        checkout_thread = threading.Thread(
+            target=run_checkout,
+            name="cart-checkout",
+        )
+
+        checkout_thread.start()
+
+        try:
+            self.assertTrue(
+                checkout_has_lock.wait(timeout=10),
+                "Checkout did not acquire the cart lock.",
+            )
+
+            update_thread = threading.Thread(
+                target=run_update,
+                name="cart-update",
+            )
+            update_thread.start()
+
+            time.sleep(0.3)
+            self.assertFalse(
+                update_finished.is_set(),
+                "The update should wait while checkout holds the cart lock.",
+            )
+
+            allow_checkout_to_continue.set()
+
+            checkout_thread.join(timeout=10)
+            update_thread.join(timeout=10)
+
+            self.assertFalse(checkout_thread.is_alive())
+            self.assertFalse(update_thread.is_alive())
+        finally:
+            allow_checkout_to_continue.set()
+            checkout_thread.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(results.get("checkout_deleted_item"))
+        self.assertEqual(results.get("update_response"), 404)
+
+        self.assertFalse(
+            CartItem.objects.filter(pk=item_id).exists(),
+            "The update must not recreate the item after checkout deletes it.",
+        )

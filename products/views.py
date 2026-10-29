@@ -1206,14 +1206,23 @@ class CustomerCartItemDetailView(APIView):
         quantity = input_serializer.validated_data["quantity"]
 
         with transaction.atomic():
-            cart_item = get_object_or_404(
-                CartItem.objects.select_related("cart"),
+            initial_item = get_object_or_404(
+                CartItem.objects.only("id", "cart_id"),
                 pk=pk,
                 cart__customer=request.user,
             )
 
-            cart = Cart.objects.select_for_update().get(
-                pk=cart_item.cart_id,
+            cart = get_object_or_404(
+                Cart.objects.select_for_update(),
+                pk=initial_item.cart_id,
+                customer=request.user,
+            )
+
+            # Re-fetch after acquiring the cart lock.
+            # Checkout may have deleted the item while we waited.
+            cart_item = get_object_or_404(
+                CartItem.objects.filter(cart=cart),
+                pk=pk,
             )
 
             product = Product.objects.select_for_update().filter(
@@ -1253,14 +1262,22 @@ class CustomerCartItemDetailView(APIView):
     )
     def delete(self, request, pk):
         with transaction.atomic():
-            cart_item = get_object_or_404(
-                CartItem.objects.select_related("cart"),
+            initial_item = get_object_or_404(
+                CartItem.objects.only("id", "cart_id"),
                 pk=pk,
                 cart__customer=request.user,
             )
 
-            cart = Cart.objects.select_for_update().get(
-                pk=cart_item.cart_id,
+            cart = get_object_or_404(
+                Cart.objects.select_for_update(),
+                pk=initial_item.cart_id,
+                customer=request.user,
+            )
+
+            # Re-check ownership and existence after locking the cart.
+            cart_item = get_object_or_404(
+                CartItem.objects.filter(cart=cart),
+                pk=pk,
             )
 
             cart_item.delete()

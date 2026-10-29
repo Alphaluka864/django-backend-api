@@ -2851,6 +2851,89 @@ class CustomerOrderAPITests(APITestCase):
         self.assertEqual(movement.quantity, 3)
         self.assertEqual(movement.created_by, self.customer)
 
+    def test_customer_cancelling_multi_product_order_restores_stock_once(self):
+        second_product = Product.objects.create(
+            name="Cancellation Test Product",
+            description="Product used to test multi-item order cancellation.",
+            price=Decimal("1500.00"),
+            stock_quantity=10,
+            owner=self.seller,
+            status=Product.Status.PUBLISHED,
+        )
+        checkout_response = self.client.post(
+            self.checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 3,
+                    },
+                    {
+                        "product_id": second_product.id,
+                        "quantity": 2,
+                    },
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(checkout_response.status_code, 201)
+        order = CustomerOrder.objects.get(
+            order_number=checkout_response.data["order_number"]
+        )
+        cancel_url = f"/api/customer/orders/{order.id}/cancel/"
+
+        first_response = self.client.post(cancel_url)
+        self.assertEqual(first_response.status_code, 200)
+
+        self.product.refresh_from_db()
+        second_product.refresh_from_db()
+        order.refresh_from_db()
+
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(second_product.stock_quantity, 10)
+        self.assertEqual(order.status, CustomerOrder.Status.CANCELLED)
+
+        items = list(order.items.all())
+        self.assertEqual(len(items), 2)
+
+        for item in items:
+            self.assertEqual(
+                item.fulfillment_status,
+                CustomerOrderItem.FulfillmentStatus.CANCELLED,
+            )
+
+        for product, expected_quantity in (
+            (self.product, 3),
+            (second_product, 2),
+        ):
+            movement = InventoryMovement.objects.get(
+                product=product,
+                movement_type=InventoryMovement.MovementType.STOCK_IN,
+                note__contains=order.order_number,
+            )
+            self.assertEqual(movement.quantity, expected_quantity)
+            self.assertEqual(movement.created_by, self.customer)
+
+        second_response = self.client.post(cancel_url)
+        self.assertEqual(second_response.status_code, 400)
+
+        self.product.refresh_from_db()
+        second_product.refresh_from_db()
+
+        self.assertEqual(self.product.stock_quantity, 20)
+        self.assertEqual(second_product.stock_quantity, 10)
+
+        for product in (self.product, second_product):
+            self.assertEqual(
+                InventoryMovement.objects.filter(
+                    product=product,
+                    movement_type=InventoryMovement.MovementType.STOCK_IN,
+                    note__contains=order.order_number,
+                ).count(),
+                1,
+            )
+
     def test_customer_cannot_cancel_another_customers_order(self):
         order = CustomerOrder.objects.create(
             order_number="CO-CANCEL-OTHER-001",

@@ -1433,15 +1433,45 @@ class CustomerOrderCancelView(APIView):
                     "the cancellable stage."
                 )
 
-            for item in items:
-                product = (
-                    Product.objects
-                    .select_for_update()
-                    .get(pk=item.product_id)
+            # Lock all affected products in ascending ID order.
+            # This prevents concurrent multi-item cancellations from
+            # acquiring the same product locks in opposite orders.
+            product_ids = sorted({
+                item.product_id for item in items
+            })
+
+            locked_products = list(
+                Product.objects
+                .select_for_update()
+                .filter(pk__in=product_ids)
+                .order_by("pk")
+            )
+
+            products_by_id = {
+                product.pk: product
+                for product in locked_products
+            }
+
+            if len(products_by_id) != len(product_ids):
+                raise ValidationError(
+                    "One or more products in this order no longer exist."
                 )
 
-                product.stock_quantity += item.quantity
-                product.save(update_fields=["stock_quantity"])
+            # Restore stock only after every product lock is acquired.
+            for product in locked_products:
+                quantity_to_restore = sum(
+                    item.quantity
+                    for item in items
+                    if item.product_id == product.pk
+                )
+
+                product.stock_quantity += quantity_to_restore
+                product.save(
+                    update_fields=["stock_quantity", "updated_at"]
+                )
+
+            for item in items:
+                product = products_by_id[item.product_id]
 
                 InventoryMovement.objects.create(
                     product=product,

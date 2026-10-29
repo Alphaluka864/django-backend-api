@@ -15,7 +15,13 @@ from .models import (
 )
 from django.db import IntegrityError, transaction
 from django.core.cache import cache
-from .models import SellerProfile,CustomerOrder, CustomerOrderItem
+from .models import (
+    SellerProfile,
+    CustomerOrder,
+    CustomerOrderItem,
+    Cart,
+    CartItem,
+)
 
 class InventoryAPITests(TestCase):
     def setUp(self):
@@ -743,7 +749,7 @@ class ProductDetailTests(APITestCase):
 class UserRegistrationTests(APITestCase):
     def setUp(self):
         cache.clear()
-        
+
     def test_user_can_register(self):
         response = self.client.post(
             "/api/register/",
@@ -2766,7 +2772,7 @@ class CustomerOrderAPITests(APITestCase):
             for item in response.data["results"]
         ]
         self.assertEqual(order_numbers, ["CO-OWN-TEST-001"])
- 
+
     def test_customer_cannot_retrieve_another_customers_order(self):
         other_order = CustomerOrder.objects.create(
             order_number="CO-PRIVATE-TEST-001",
@@ -2798,7 +2804,7 @@ class CustomerOrderAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(CustomerOrder.objects.count(), 0)
-    
+
     def test_customer_can_cancel_own_order_and_restore_stock(self):
         checkout_response = self.client.post(
             self.checkout_url,
@@ -3176,7 +3182,7 @@ class SellerOrderManagementTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 401)
-        
+
     def test_order_status_updates_when_all_items_are_delivered(self):
         response = self.client.patch(
             self.status_url,
@@ -3233,7 +3239,7 @@ class SellerOrderManagementTests(APITestCase):
             self.order.status,
             CustomerOrder.Status.PENDING,
         )
-        
+
     def test_cancelling_one_item_does_not_cancel_order_with_active_items(self):
         second_item = CustomerOrderItem.objects.create(
             order=self.order,
@@ -3262,3 +3268,326 @@ class SellerOrderManagementTests(APITestCase):
             second_item.fulfillment_status,
             CustomerOrderItem.FulfillmentStatus.PENDING,
         )
+
+class CustomerCartAPITests(APITestCase):
+    def setUp(self):
+        self.customer = User.objects.create_user(
+            username="cart_customer",
+            password="CustomerPass123!",
+        )
+
+        self.other_customer = User.objects.create_user(
+            username="other_cart_customer",
+            password="CustomerPass123!",
+        )
+
+        self.seller = User.objects.create_user(
+            username="cart_seller",
+            password="SellerPass123!",
+        )
+
+        SellerProfile.objects.create(
+            user=self.seller,
+            business_name="Cart Test Store",
+            status=SellerProfile.Status.APPROVED,
+        )
+
+        self.category = Category.objects.create(
+            name="Cart Test Category",
+        )
+
+        self.product = Product.objects.create(
+            owner=self.seller,
+            category=self.category,
+            name="Cart Test Rice",
+            description="Rice for cart tests",
+            price=Decimal("2500.00"),
+            stock_quantity=20,
+            status=Product.Status.PUBLISHED,
+        )
+
+        self.cart_url = "/api/cart/"
+        self.cart_items_url = "/api/cart/items/"
+        self.cart_checkout_url = "/api/cart/checkout/"
+        self.direct_checkout_url = "/api/checkout/"
+
+        self.client.force_authenticate(user=self.customer)
+
+    def add_product(self, product=None, quantity=1):
+        product = product or self.product
+
+        return self.client.post(
+            self.cart_items_url,
+            {
+                "product_id": product.id,
+                "quantity": quantity,
+            },
+            format="json",
+        )
+
+    def test_customer_can_view_empty_cart(self):
+        response = self.client.get(self.cart_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_items"], 0)
+        self.assertEqual(
+            Decimal(str(response.data["total_amount"])),
+            Decimal("0.00"),
+        )
+        self.assertEqual(response.data["items"], [])
+
+    def test_customer_can_add_product_to_cart(self):
+        response = self.add_product(quantity=2)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["product"], self.product.id)
+        self.assertEqual(response.data["quantity"], 2)
+
+        cart = Cart.objects.get(customer=self.customer)
+
+        self.assertEqual(cart.items.count(), 1)
+        self.assertEqual(cart.items.get().quantity, 2)
+
+    def test_adding_same_product_increments_quantity(self):
+        first_response = self.add_product(quantity=2)
+        second_response = self.add_product(quantity=3)
+
+        self.assertEqual(first_response.status_code, 201)
+        self.assertEqual(second_response.status_code, 201)
+
+        cart = Cart.objects.get(customer=self.customer)
+
+        self.assertEqual(cart.items.count(), 1)
+        self.assertEqual(cart.items.get().quantity, 5)
+
+    def test_customer_can_update_cart_item_quantity(self):
+        self.add_product(quantity=2)
+
+        cart_item = CartItem.objects.get(
+            cart__customer=self.customer,
+            product=self.product,
+        )
+
+        response = self.client.patch(
+            f"{self.cart_items_url}{cart_item.id}/",
+            {"quantity": 4},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        cart_item.refresh_from_db()
+        self.assertEqual(cart_item.quantity, 4)
+
+    def test_customer_can_remove_cart_item(self):
+        self.add_product(quantity=2)
+
+        cart_item = CartItem.objects.get(
+            cart__customer=self.customer,
+            product=self.product,
+        )
+
+        response = self.client.delete(
+            f"{self.cart_items_url}{cart_item.id}/",
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(
+            CartItem.objects.filter(pk=cart_item.pk).exists()
+        )
+
+    def test_cannot_add_quantity_above_available_stock(self):
+        response = self.add_product(quantity=21)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(
+            CartItem.objects.filter(
+                cart__customer=self.customer,
+                product=self.product,
+            ).exists()
+        )
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+
+    def test_cannot_increase_cart_quantity_above_available_stock(self):
+        self.add_product(quantity=15)
+
+        cart_item = CartItem.objects.get(
+            cart__customer=self.customer,
+            product=self.product,
+        )
+
+        response = self.client.patch(
+            f"{self.cart_items_url}{cart_item.id}/",
+            {"quantity": 21},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        cart_item.refresh_from_db()
+        self.assertEqual(cart_item.quantity, 15)
+
+
+    def test_customer_cannot_update_another_customers_cart_item(self):
+        # Arrange: create a cart item belonging to another customer.
+        other_cart, _ = Cart.objects.get_or_create(
+            customer=self.other_customer,
+        )
+
+        other_item = CartItem.objects.create(
+            cart=other_cart,
+            product=self.product,
+            quantity=1,
+        )
+
+        # Authenticate as the first customer, not the item's owner.
+        self.client.force_authenticate(user=self.customer)
+
+        # Act: attempt to modify another customer's cart item.
+        response = self.client.patch(
+            f"{self.cart_items_url}{other_item.id}/",
+            {"quantity": 5},
+            format="json",
+        )
+
+        # Assert: access must be denied without changing the item.
+        self.assertEqual(response.status_code, 404)
+
+        other_item.refresh_from_db()
+        self.assertEqual(other_item.quantity, 1)
+
+
+    def test_customer_cannot_delete_another_customers_cart_item(self):
+        other_cart, _ = Cart.objects.get_or_create(
+            customer=self.other_customer,
+        )
+
+        other_item = CartItem.objects.create(
+            cart=other_cart,
+            product=self.product,
+            quantity=1,
+        )
+
+        response = self.client.delete(
+            f"{self.cart_items_url}{other_item.id}/",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(
+            CartItem.objects.filter(pk=other_item.pk).exists()
+        )
+
+    def test_customer_can_checkout_cart(self):
+        self.add_product(quantity=3)
+
+        response = self.client.post(
+            self.cart_checkout_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        order = CustomerOrder.objects.get(
+            order_number=response.data["order_number"],
+        )
+
+        self.assertEqual(order.customer, self.customer)
+        self.assertEqual(order.total_amount, Decimal("7500.00"))
+        self.assertEqual(order.items.count(), 1)
+
+        order_item = order.items.get()
+
+        self.assertEqual(order_item.product, self.product)
+        self.assertEqual(order_item.seller, self.seller)
+        self.assertEqual(order_item.quantity, 3)
+        self.assertEqual(
+            order_item.unit_price,
+            Decimal("2500.00"),
+        )
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 17)
+
+        cart = Cart.objects.get(customer=self.customer)
+        self.assertEqual(cart.items.count(), 0)
+
+        self.assertTrue(
+            InventoryMovement.objects.filter(
+                product=self.product,
+                movement_type=InventoryMovement.MovementType.STOCK_OUT,
+                quantity=3,
+                created_by=self.customer,
+            ).exists()
+        )
+
+    def test_cannot_checkout_empty_cart(self):
+        response = self.client.post(
+            self.cart_checkout_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 20)
+
+    def test_failed_checkout_preserves_cart_and_stock(self):
+        self.add_product(quantity=5)
+
+        self.product.stock_quantity = 2
+        self.product.save(update_fields=["stock_quantity"])
+
+        response = self.client.post(
+            self.cart_checkout_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        cart = Cart.objects.get(customer=self.customer)
+
+        self.assertEqual(cart.items.count(), 1)
+        self.assertEqual(cart.items.get().quantity, 5)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 2)
+
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+
+    def test_direct_checkout_still_works(self):
+        response = self.client.post(
+            self.direct_checkout_url,
+            {
+                "items": [
+                    {
+                        "product_id": self.product.id,
+                        "quantity": 2,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 18)
+
+    def test_unauthenticated_user_cannot_access_cart(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.client.get(self.cart_url)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_unauthenticated_user_cannot_add_cart_item(self):
+        self.client.force_authenticate(user=None)
+
+        response = self.add_product(quantity=1)
+
+        self.assertEqual(response.status_code, 401)

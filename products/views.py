@@ -51,10 +51,15 @@ from .serializers import (
     CustomerOrderSerializer,
     SellerOrderItemSerializer,
     SellerOrderStatusUpdateSerializer,
+    CartSerializer,
+    CartItemSerializer,
+    CartItemWriteSerializer,
+    CartItemUpdateSerializer,
 )
-from .models import CustomerOrder, CustomerOrderItem
+from .models import CustomerOrder, CustomerOrderItem, Cart, CartItem, Product
 from django.db import transaction
 from drf_spectacular.utils import extend_schema, OpenApiTypes
+from django.shortcuts import get_object_or_404
 
 @extend_schema(
     responses={200: OpenApiTypes.OBJECT},
@@ -1061,6 +1066,258 @@ class SellerDashboardSummaryView(APIView):
             "purchase_orders": purchase_order_summary,
             "recent_activity": recent_activity_data,
         })
+
+
+class CustomerCartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: CartSerializer},
+    )
+    def get(self, request):
+        cart, _ = Cart.objects.get_or_create(
+            customer=request.user,
+        )
+
+        cart = Cart.objects.prefetch_related(
+            "items__product",
+        ).get(pk=cart.pk)
+
+        return Response(
+            CartSerializer(cart).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class CustomerCartItemCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=CartItemWriteSerializer,
+        responses={201: CartItemSerializer},
+    )
+    def post(self, request):
+        input_serializer = CartItemWriteSerializer(
+            data=request.data,
+        )
+        input_serializer.is_valid(raise_exception=True)
+
+        product_id = input_serializer.validated_data["product_id"]
+        quantity = input_serializer.validated_data["quantity"]
+
+        with transaction.atomic():
+            cart, _ = Cart.objects.get_or_create(
+                customer=request.user,
+            )
+            cart = Cart.objects.select_for_update().get(
+                pk=cart.pk,
+            )
+
+            product = get_object_or_404(
+                Product.objects.select_for_update(
+                    of=("self",),
+                ).select_related("owner"),
+                pk=product_id,
+            )
+
+            if product.status != Product.Status.PUBLISHED:
+                raise ValidationError(
+                    {"product_id": "This product is not available for sale."}
+                )
+
+            if not product.owner_id:
+                raise ValidationError(
+                    {"product_id": "This product has no assigned seller."}
+                )
+
+            seller_profile = getattr(
+                product.owner,
+                "seller_profile",
+                None,
+            )
+
+            if (
+                seller_profile is None
+                or seller_profile.status != SellerProfile.Status.APPROVED
+            ):
+                raise ValidationError(
+                    {"product_id": "The product's seller is not approved."}
+                )
+
+            if product.price <= Decimal("0.00"):
+                raise ValidationError(
+                    {"product_id": "This product has an invalid price."}
+                )
+
+            cart_item = CartItem.objects.filter(
+                cart=cart,
+                product=product,
+            ).first()
+
+            new_quantity = quantity
+            if cart_item:
+                new_quantity += cart_item.quantity
+
+            if new_quantity > product.stock_quantity:
+                raise ValidationError(
+                    {
+                        "quantity": (
+                            f"Only {product.stock_quantity} units are "
+                            "currently in stock."
+                        )
+                    }
+                )
+
+            if cart_item:
+                cart_item.quantity = new_quantity
+                cart_item.save(update_fields=["quantity", "updated_at"])
+            else:
+                cart_item = CartItem.objects.create(
+                    cart=cart,
+                    product=product,
+                    quantity=quantity,
+                )
+
+            cart.save(update_fields=["updated_at"])
+
+        cart_item = CartItem.objects.select_related(
+            "product",
+        ).get(pk=cart_item.pk)
+
+        return Response(
+            CartItemSerializer(cart_item).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CustomerCartItemDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=CartItemUpdateSerializer,
+        responses={200: CartItemSerializer},
+    )
+    def patch(self, request, pk):
+        input_serializer = CartItemUpdateSerializer(
+            data=request.data,
+        )
+        input_serializer.is_valid(raise_exception=True)
+
+        quantity = input_serializer.validated_data["quantity"]
+
+        with transaction.atomic():
+            cart_item = get_object_or_404(
+                CartItem.objects.select_related("cart"),
+                pk=pk,
+                cart__customer=request.user,
+            )
+
+            cart = Cart.objects.select_for_update().get(
+                pk=cart_item.cart_id,
+            )
+
+            product = Product.objects.select_for_update().filter(
+                pk=cart_item.product_id,
+            ).first()
+
+            if product is None:
+                raise ValidationError(
+                    {"product": "This product is no longer available."}
+                )
+
+            if quantity > product.stock_quantity:
+                raise ValidationError(
+                    {
+                        "quantity": (
+                            f"Only {product.stock_quantity} units are "
+                            "currently in stock."
+                        )
+                    }
+                )
+
+            cart_item.quantity = quantity
+            cart_item.save(update_fields=["quantity", "updated_at"])
+            cart.save(update_fields=["updated_at"])
+
+        cart_item = CartItem.objects.select_related(
+            "product",
+        ).get(pk=cart_item.pk)
+
+        return Response(
+            CartItemSerializer(cart_item).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        responses={204: None},
+    )
+    def delete(self, request, pk):
+        with transaction.atomic():
+            cart_item = get_object_or_404(
+                CartItem.objects.select_related("cart"),
+                pk=pk,
+                cart__customer=request.user,
+            )
+
+            cart = Cart.objects.select_for_update().get(
+                pk=cart_item.cart_id,
+            )
+
+            cart_item.delete()
+            cart.save(update_fields=["updated_at"])
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CustomerCartCheckoutView(APIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerCheckoutSerializer
+
+    @extend_schema(
+        request=CustomerCheckoutSerializer,
+        responses={201: CustomerOrderSerializer},
+    )
+    def post(self, request):
+        with transaction.atomic():
+            cart, _ = Cart.objects.get_or_create(
+                customer=request.user,
+            )
+            cart = Cart.objects.select_for_update().get(
+                pk=cart.pk,
+            )
+
+            cart_items = list(
+                cart.items.order_by("product_id"),
+            )
+
+            if not cart_items:
+                raise ValidationError(
+                    {"cart": "Your cart is empty."}
+                )
+
+            checkout_data = {
+                "items": [
+                    {
+                        "product_id": item.product_id,
+                        "quantity": item.quantity,
+                    }
+                    for item in cart_items
+                ],
+            }
+
+            input_serializer = CustomerCheckoutSerializer(
+                data=checkout_data,
+                context={"request": request},
+            )
+            input_serializer.is_valid(raise_exception=True)
+            order = input_serializer.save()
+
+            cart.items.all().delete()
+
+        return Response(
+            CustomerOrderSerializer(order).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class CustomerCheckoutView(APIView):

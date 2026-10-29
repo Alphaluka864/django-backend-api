@@ -22,9 +22,9 @@ from .models import (
     ProductAuditLog,
     CustomerOrder,
     CustomerOrderItem,
+    Cart,
+    CartItem,
 )
-
-
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
@@ -460,6 +460,84 @@ class SellerProfileAdminSerializer(serializers.ModelSerializer):
 
 class CustomerOrderItemInputSerializer(serializers.Serializer):
     product_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class CartItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+    product_price = serializers.DecimalField(
+        source="product.price",
+        max_digits=10,
+        decimal_places=2,
+        read_only=True,
+    )
+    line_total = serializers.SerializerMethodField()
+    available_stock = serializers.IntegerField(
+        source="product.stock_quantity",
+        read_only=True,
+    )
+
+    class Meta:
+        model = CartItem
+        fields = [
+            "id",
+            "product",
+            "product_name",
+            "product_price",
+            "quantity",
+            "available_stock",
+            "line_total",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(OpenApiTypes.DECIMAL)
+    def get_line_total(self, obj):
+        return obj.product.price * obj.quantity
+
+
+class CartSerializer(serializers.ModelSerializer):
+    items = CartItemSerializer(many=True, read_only=True)
+    total_items = serializers.SerializerMethodField()
+    total_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cart
+        fields = [
+            "id",
+            "items",
+            "total_items",
+            "total_amount",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_total_items(self, obj):
+        return sum(item.quantity for item in obj.items.all())
+
+    @extend_schema_field(OpenApiTypes.DECIMAL)
+    def get_total_amount(self, obj):
+        return sum(
+            (
+                item.product.price * item.quantity
+                for item in obj.items.all()
+            ),
+            Decimal("0.00"),
+        )
+
+
+class CartItemWriteSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class CartItemUpdateSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
 

@@ -28,6 +28,10 @@ from .views import (
     AdminSellerApplicationListView,
     AdminSellerApplicationReviewView,
     CustomerCheckoutView,
+    CustomerCartView,
+    CustomerCartItemCreateView,
+    CustomerCartItemDetailView,
+    CustomerCartCheckoutView,
     CustomerOrderListView,
     CustomerOrderDetailView,
     SellerOrderListView,
@@ -188,6 +192,28 @@ urlpatterns = [
         CustomerCheckoutView.as_view(),
         name="customer-checkout",
     ),
+
+    path(
+        "cart/",
+        CustomerCartView.as_view(),
+        name="customer-cart",
+    ),
+    path(
+        "cart/items/",
+        CustomerCartItemCreateView.as_view(),
+        name="customer-cart-item-create",
+    ),
+    path(
+        "cart/items/<int:pk>/",
+        CustomerCartItemDetailView.as_view(),
+        name="customer-cart-item-detail",
+    ),
+    path(
+        "cart/checkout/",
+        CustomerCartCheckoutView.as_view(),
+        name="customer-cart-checkout",
+    ),
+
     path(
         "customer/orders/",
         CustomerOrderListView.as_view(),

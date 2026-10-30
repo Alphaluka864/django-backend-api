@@ -15,6 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=django:django . .
 
+# Create a writable directory for Django static files
+RUN mkdir -p /app/staticfiles \
+    && chown django:django /app/staticfiles
+
 USER django
 
 EXPOSE 8000
